@@ -1,0 +1,3118 @@
+实时动态库存需求预测分析平台 v1.0
+#include <vector>
+#include <string>
+#include <stdexcept>
+#include <sqlite3.h>
+#include <memory>
+struct DemandPrediction {
+ std::string date; // 预测日期
+ std::string product_name; // 产品名称
+ int predicted_weeks; // 预测周数
+ std::string sales_category; // 销售品类
+ int demand_quantity; // 需求量
+ int inventory_suggestion; // 库存建议
+};
+std::vector<DemandPrediction> get_all_demand_predictions() {
+ try {
+ // 获取默认数据库连接
+ std::unique_ptr<sqlite3, decltype(&sqlite3_close)> db_connection(
+ nullptr, sqlite3_close);
+ int rc = sqlite3_open("demand_predictions.db", db_connection.release());
+ if (rc != SQLITE_OK) {
+ throw std::runtime_error("Failed to connect to database");
+ }
+ // 初始化数据库连接
+ std::vector<DemandPrediction> result;
+ std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)> stmt(
+ nullptr, sqlite3_finalize);
+ rc = sqlite3_prepare_v2(db_connection.get(), 
+ "SELECT date, product_name, predicted_weeks, "
+ "sales_category, demand_quantity, "
+ "inventory_suggestion FROM demand_predictions", 
+ -1, stmt.release(), nullptr);
+ if (rc != SQLITE_OK) {
+ sqlite3_close(db_connection.release());
+ throw std::runtime_error("Failed to prepare SQL statement");
+ }
+ while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+ DemandPrediction prediction;
+ prediction.date = std::string(reinterpret_cast<char*>(sqlite3_column_text(stmt.get(), 0)));
+ prediction.product_name = std::string(reinterpret_cast<char*>(sqlite3_column_text(stmt.get(), 1)));
+ prediction.predicted_weeks = sqlite3_column_int(stmt.get(), 2);
+ prediction.sales_category = std::string(reinterpret_cast<char*>(sqlite3_column_text(stmt.get(), 3)));
+ prediction.demand_quantity = sqlite3_column_int(stmt.get(), 4);
+ prediction.inventory_suggestion = sqlite3_column_int(stmt.get(), 5);
+ result.push_back(prediction);
+ }
+ sqlite3_finalize(stmt.get());
+ sqlite3_close(db_connection.get());
+ return result;
+ } catch (const std::exception& error) {
+ // 记录错误日志
+1
+实时动态库存需求预测分析平台 v1.0
+ std::cerr << "Database operation failed: " << error.what() << std::endl;
+ return {};
+ }
+}
+#include <sqlite3.h>
+#include <sstream>
+#include <string>
+#include <nlohmann/json.hpp>
+#include <stdexcept>
+#include <iostream>
+#include <date/date.h>
+namespace retail {
+ namespace supplychain {
+ using namespace nlohmann;
+ json predict_demand(const std::string& date_str, int product_id, int predict_weeks, const std::string& category) {
+ // 参数校验
+ if (product_id <= 0) {
+ std::cerr << "product_id 必须为正整数" << std::endl;
+ return {};
+ }
+ if (predict_weeks < 1) {
+ std::cerr << "predict_weeks 必须大于等于 1" << std::endl;
+ return {};
+ }
+ if (category.empty()) {
+ std::cerr << "category 不能为空" << std::endl;
+ return {};
+ }
+ // 日期格式验证
+ std::istringstream date_stream(date_str);
+ std::tm tm = {};
+ date_stream >> std::get_time(&tm, "%Y-%m-%d");
+ if (date_stream.fail()) {
+ std::cerr << "日期格式错误，应为 YYYY-MM-DD" << std::endl;
+ return {};
+ }
+ // 转换日期格式为 sys_days 进行周计算
+ date::year_month_day target_date = date::from_string(date_str, "%Y-%m-%d");
+ date::sys_days start_date = target_date - date::weeks(predict_weeks - 1);
+ std::string start_date_str = date::to_string(start_date);
+ std::string end_date_str = date::to_string(target_date);
+ // 获取默认数据库连接
+ sqlite3* db;
+ int rc = sqlite3_open("sales.db", &db);
+ if (rc != SQLITE_OK) {
+ std::cerr << "无法连接数据库: " << sqlite3_errmsg(db) << std::endl;
+ sqlite3_close(db);
+ return {};
+ }
+ // 查询 SQL 语句
+2
+实时动态库存需求预测分析平台 v1.0
+ std::string query = "SELECT SUM(quantity) FROM sales WHERE product_id = ? AND category = ? AND date BETWEEN ? 
+AND ?;";
+ sqlite3_stmt* stmt;
+ rc = sqlite3_prepare_v2(db, query.c_str(), -1, &stmt, nullptr);
+ if (rc != SQLITE_OK) {
+ std::cerr << "SQL 预编译失败: " << sqlite3_errmsg(db) << std::endl;
+ sqlite3_close(db);
+ return {};
+ }
+ // 绑定参数
+ sqlite3_bind_int(stmt, 1, product_id);
+ sqlite3_bind_text(stmt, 2, category.c_str(), -1, SQLITE_STATIC);
+ sqlite3_bind_text(stmt, 3, start_date_str.c_str(), -1, SQLITE_STATIC);
+ sqlite3_bind_text(stmt, 4, end_date_str.c_str(), -1, SQLITE_STATIC);
+ // 执行查询并获取结果
+ rc = sqlite3_step(stmt);
+ if (rc != SQLITE_ROW) {
+ std::cerr << "查询失败: " << sqlite3_errmsg(db) << std::endl;
+ sqlite3_finalize(stmt);
+ sqlite3_close(db);
+ return {};
+ }
+ // 提取总销售量
+ int total_sales = sqlite3_column_int(stmt, 0);
+ if (total_sales == 0) {
+ std::cerr << "没有找到足够的销售数据进行预测" << std::endl;
+ sqlite3_finalize(stmt);
+ sqlite3_close(db);
+ return {};
+ }
+ // 计算平均销售量作为预测值
+ int avg_sales = total_sales / predict_weeks;
+ // 建议库存数量（预测值的 1.2 倍）
+ int suggested_stock = static_cast<int>(avg_sales * 1.2);
+ // 构造预测结果
+ json result = {
+ {"predicted_demand", avg_sales},
+ {"suggested_stock", suggested_stock}
+ };
+ // 释放资源
+ sqlite3_finalize(stmt);
+ sqlite3_close(db);
+ return result;
+ }
+ } // namespace supplychain
+} // namespace retail
+#include <sqlite3.h>
+#include <map>
+#include <string>
+#include <variant>
+3
+实时动态库存需求预测分析平台 v1.0
+#include <stdexcept>
+#include <iostream>
+using namespace std::string_literals;
+// 定义预测信息结构体
+struct DemandPrediction {
+ int product_id;
+ std::string predict_date;
+ int weeks;
+ std::string category;
+ double demand;
+};
+// 将 DemandPrediction 转换为 std::map
+std::map<std::string, std::variant<int, std::string, double>> to_map(const DemandPrediction& pred) {
+ std::map<std::string, std::variant<int, std::string, double>> result;
+ result["product_id"] = pred.product_id;
+ result["predict_date"] = pred.predict_date;
+ result["weeks"] = pred.weeks;
+ result["category"] = pred.category;
+ result["demand"] = pred.demand;
+ return result;
+}
+// 记录错误日志
+void log_error(const std::string& message) {
+ std::cerr << "ERROR: " << message << std::endl;
+}
+std::map<std::string, std::variant<int, std::string, double>> update_demand_prediction(int product_id, const 
+std::map<std::string, std::variant<int, std::string, double>>& update_fields) {
+ // 参数校验
+ if (product_id <= 0) {
+ log_error("Invalid product ID provided");
+ return {};
+ }
+ if (update_fields.empty()) {
+ log_error("No fields provided for update");
+ return {};
+ }
+ // 检查所有 update 字段是否有效
+ for (const auto& [field, value] : update_fields) {
+ if (field == "product_id") {
+ log_error("Updating product ID is not allowed");
+ return {};
+ }
+ if (field != "predict_date" && field != "weeks" && field != "category" && field != "demand") {
+ log_error("Invalid field name: " + field);
+ return {};
+ }
+ }
+ sqlite3* db;
+ int rc = sqlite3_open("demand.db", &db);
+ if (rc != SQLITE_OK) {
+4
+实时动态库存需求预测分析平台 v1.0
+ log_error("Failed to open database");
+ return {};
+ }
+ sqlite3_stmt* stmt;
+ // 查询现有记录
+ std::string query = "SELECT product_id, predict_date, weeks, category, demand FROM demand_predictions WHERE 
+product_id = ?";
+ rc = sqlite3_prepare_v2(db, query.c_str(), -1, &stmt, nullptr);
+ if (rc != SQLITE_OK) {
+ log_error("Failed to prepare query for existing record");
+ sqlite3_close(db);
+ return {};
+ }
+ sqlite3_bind_int(stmt, 1, product_id);
+ if (sqlite3_step(stmt) != SQLITE_ROW) {
+ // 未找到记录
+ log_error("Product not found in database");
+ sqlite3_finalize(stmt);
+ sqlite3_close(db);
+ return {};
+ }
+ // 构造 UPDATE 语句
+ std::string set_clause;
+ std::vector<std::variant<int, std::string, double>> params;
+ for (const auto& [field, value] : update_fields) {
+ set_clause += field + " = ?, ";
+ params.push_back(value);
+ }
+ if (!set_clause.empty()) {
+ set_clause = set_clause.substr(0, set_clause.length() - 2);
+ }
+ std::string update_sql = "UPDATE demand_predictions SET " + set_clause + " WHERE product_id = ?";
+ params.push_back(product_id);
+ // 准备 UPDATE 语句
+ rc = sqlite3_prepare_v2(db, update_sql.c_str(), -1, &stmt, nullptr);
+ if (rc != SQLITE_OK) {
+ log_error("Failed to prepare update statement");
+ sqlite3_finalize(stmt);
+ sqlite3_close(db);
+ return {};
+ }
+ int param_index = 1;
+ for (const auto& value : params) {
+ if (std::holds_alternative<int>(value)) {
+ sqlite3_bind_int(stmt, param_index, std::get<int>(value));
+ } else if (std::holds_alternative<std::string>(value)) {
+ const std::string& str_value = std::get<std::string>(value);
+ sqlite3_bind_text(stmt, param_index, str_value.c_str(), -1, SQLITE_TRANSIENT);
+ } else if (std::holds_alternative<double>(value)) {
+ sqlite3_bind_double(stmt, param_index, std::get<double>(value));
+5
+实时动态库存需求预测分析平台 v1.0
+ }
+ param_index++;
+ }
+ // 执行更新
+ if (sqlite3_step(stmt) != SQLITE_DONE) {
+ log_error("Failed to execute update statement");
+ sqlite3_finalize(stmt);
+ sqlite3_close(db);
+ return {};
+ }
+ sqlite3_finalize(stmt);
+ // 查询更新后的记录
+ rc = sqlite3_prepare_v2(db, query.c_str(), -1, &stmt, nullptr);
+ if (rc != SQLITE_OK) {
+ log_error("Failed to prepare select statement");
+ sqlite3_close(db);
+ return {};
+ }
+ sqlite3_bind_int(stmt, 1, product_id);
+ if (sqlite3_step(stmt) == SQLITE_ROW) {
+ DemandPrediction updated;
+ updated.product_id = sqlite3_column_int(stmt, 0);
+ updated.predict_date = std::string(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1)));
+ updated.weeks = sqlite3_column_int(stmt, 2);
+ updated.category = std::string(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3)));
+ updated.demand = sqlite3_column_double(stmt, 4);
+ sqlite3_finalize(stmt);
+ sqlite3_close(db);
+ return to_map(updated);
+ } else {
+ log_error("Failed to retrieve updated record");
+ sqlite3_finalize(stmt);
+ sqlite3_close(db);
+ return {};
+ }
+}
+#include <Poco/Data/Session.h>
+#include <Poco/Data/MySQL/MySQLConnector.h>
+#include <Poco/Data/MySQL/MySQLResult.h>
+#include <Poco/Data/MySQL/MySQLTransaction.h>
+#include <map>
+#include <string>
+#include <stdexcept>
+#include <Poco/Logger.h>
+#include <Poco/NumberParser.h>
+// 自定义异常类：库存策略未找到
+class InventoryStrategyNotFoundException : public std::runtime_error {
+public:
+ InventoryStrategyNotFoundException(const std::string& message) : std::runtime_error(message) {}
+};
+6
+实时动态库存需求预测分析平台 v1.0
+// 计算库存建议函数
+std::map<std::string, int> calculate_inventory_suggestion(
+ const std::string& forecast_date, 
+ int product_id, 
+ int forecast_weeks, 
+ const std::string& sales_category, 
+ int forecast_demand) {
+ // 参数校验
+ if (product_id <= 0) {
+ return {};
+ }
+ if (forecast_weeks < 0) {
+ return {};
+ }
+ if (forecast_demand < 0) {
+ return {};
+ }
+ if (sales_category.empty()) {
+ return {};
+ }
+ // 获取默认数据库连接
+ try {
+ Poco::Data::MySQL::Connector::registerConnector();
+ Poco::Data::Session session("MySQL", "connection_string");
+ // 初始化数据库连接
+ Poco::Data::Statement stmt(session);
+ stmt << "SELECT safety_stock, buffer_ratio FROM inventory_strategy WHERE product_id = ? AND sales_category = ?";
+ // 绑定查询参数
+ stmt.bind(product_id);
+ stmt.bind(sales_category);
+ Poco::Data::MySQL::Result result_set(stmt);
+ // 检查查询结果
+ if (result_set.rowCount() == 0) {
+ return {};
+ }
+ // 从结果集中提取策略参数
+ int safety_stock = result_set.row(0).get<int>(0);
+ int buffer_ratio = result_set.row(0).get<int>(1);
+ // 库存建议计算逻辑
+ int suggested_stock = static_cast<int>(forecast_demand * forecast_weeks * buffer_ratio) + safety_stock;
+ // 构造返回的建议库存字典
+ std::map<std::string, int> inventory_suggestion;
+ inventory_suggestion["suggested_stock"] = suggested_stock;
+ inventory_suggestion["product_id"] = product_id;
+ inventory_suggestion["forecast_weeks"] = forecast_weeks;
+ inventory_suggestion["sales_category"] = std::hash<std::string>()(sales_category);
+ return inventory_suggestion;
+ } catch (const Poco::Data::MySQL::MySQLException& e) {
+ // 记录错误日志
+ Poco::Logger::get("InventoryService").error("数据库操作失败: " + std::string(e.what()));
+7
+实时动态库存需求预测分析平台 v1.0
+ return {};
+ } catch (...) {
+ // 记录错误日志
+ Poco::Logger::get("InventoryService").error("未知错误");
+ return {};
+ }
+}
+#include <iostream>
+#include <string>
+#include <map>
+#include <stdexcept>
+#include <ctime>
+#include <sqlite3.h>
+std::map<std::string, bool> delete_demand_prediction(const std::string& product_id, const std::string& forecast_date) {
+ // 参数校验
+ if (product_id.empty()) {
+ std::cerr << "Product ID is required." << std::endl;
+ return {};
+ }
+ if (forecast_date.empty()) {
+ std::cerr << "Forecast date is required." << std::endl;
+ return {};
+ }
+ // 验证日期格式是否为标准格式
+ std::tm tm_date = {};
+ if (strptime(forecast_date.c_str(), "%Y-%m-%d", &tm_date) == nullptr) {
+ std::cerr << "Invalid date format for forecast date." << std::endl;
+ return {};
+ }
+ sqlite3* db = nullptr;
+ try {
+ // 获取数据库连接
+ int rc = sqlite3_open(":memory:", &db);
+ if (rc != SQLITE_OK) {
+ std::cerr << "Failed to connect to database: " << sqlite3_errmsg(db) << std::endl;
+ throw std::runtime_error("Failed to connect to database");
+ }
+ // 构造删除 SQL
+ std::string sql = "DELETE FROM demand_predictions WHERE product_id = ? AND forecast_date = ?";
+ int prepared_rc = sqlite3_prepare_v2(db, sql.c_str(), -1, &db, nullptr);
+ if (prepared_rc != SQLITE_OK) {
+ std::cerr << "Failed to prepare SQL statement: " << sqlite3_errmsg(db) << std::endl;
+ throw std::runtime_error("Failed to prepare SQL statement");
+ }
+ // 绑定参数
+ sqlite3_bind_text(db, 1, product_id.c_str(), -1, SQLITE_TRANSIENT);
+ sqlite3_bind_text(db, 2, forecast_date.c_str(), -1, SQLITE_TRANSIENT);
+ // 执行 SQL
+ int exec_rc = sqlite3_step(db);
+ if (exec_rc != SQLITE_DONE) {
+8
+实时动态库存需求预测分析平台 v1.0
+ std::cerr << "Database error during deletion: " << sqlite3_errmsg(db) << std::endl;
+ throw std::runtime_error("Database error during deletion");
+ }
+ // 检查删除结果
+ int affected_rows = sqlite3_changes(db);
+ if (affected_rows == 0) {
+ std::cerr << "No records found for deletion." << std::endl;
+ throw std::runtime_error("No records found for deletion");
+ }
+ // 释放 SQL 语句资源
+ sqlite3_finalize(db);
+ sqlite3_close(db);
+ std::map<std::string, bool> result;
+ result["success"] = true;
+ return result;
+ } catch (const std::exception& e) {
+ std::cerr << "Exception: " << e.what() << std::endl;
+ if (db) {
+ sqlite3_close(db);
+ }
+ return {};
+ }
+}
+#include <sqlite3.h>
+#include <map>
+#include <variant>
+#include <string>
+#include <vector>
+#include <stdexcept>
+#include <iostream>
+// 定义过滤参数结构体
+struct FilterParams {
+ std::string date; // 预测日期
+ int product_id; // 产品编号
+ int week_number; // 预测周数
+ std::string category; // 销售品类
+};
+// 定义预测数据返回结构，包含预测需求和库存建议
+struct PredictionResult {
+ double predicted_demand; // 预测需求值
+ std::string inventory_suggestion; // 库存建议描述
+};
+// 获取需求预测信息
+std::map<std::string, std::variant<double, std::string>> get_demand_prediction(const FilterParams& filter) {
+ // 参数校验
+ if (filter.product_id <= 0) {
+ std::cerr << "无效产品编号" << std::endl;
+ return {};
+ }
+ if (filter.week_number < 0) {
+9
+实时动态库存需求预测分析平台 v1.0
+ std::cerr << "无效的周数" << std::endl;
+ return {};
+ }
+ // 初始化数据库连接
+ sqlite3* db = nullptr;
+ int result = sqlite3_open("demand.db", &db);
+ if (result != SQLITE_OK) {
+ std::cerr << "无法连接到数据库" << std::endl;
+ return {};
+ }
+ std::string sql = "SELECT predicted_demand, inventory_suggestion FROM product_predictions WHERE 1=1";
+ std::vector<std::string> parameters;
+ // 构建查询条件
+ if (!filter.date.empty()) {
+ sql += " AND predicted_date = ?";
+ parameters.push_back(filter.date);
+ }
+ if (filter.product_id != 0) {
+ sql += " AND product_id = ?";
+ parameters.push_back(std::to_string(filter.product_id));
+ }
+ if (filter.week_number >= 0) {
+ sql += " AND week_number = ?";
+ parameters.push_back(std::to_string(filter.week_number));
+ }
+ if (!filter.category.empty()) {
+ sql += " AND category = ?";
+ parameters.push_back(filter.category);
+ }
+ sqlite3_stmt* stmt = nullptr;
+ result = sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
+ if (result != SQLITE_OK) {
+ std::cerr << "SQL 语句准备失败" << std::endl;
+ sqlite3_close(db);
+ return {};
+ }
+ // 绑定参数
+ for (size_t i = 0; i < parameters.size(); ++i) {
+ if (sqlite3_bind_text(stmt, i + 1, parameters[i].c_str(), -1, SQLITE_TRANSIENT) != SQLITE_OK) {
+ std::cerr << "参数绑定失败" << std::endl;
+ sqlite3_close(db);
+ sqlite3_finalize(stmt);
+ return {};
+ }
+ }
+ std::map<std::string, std::variant<double, std::string>> prediction_data;
+ result = sqlite3_step(stmt);
+ if (result != SQLITE_ROW) {
+ std::cerr << "查询未返回任何行" << std::endl;
+ sqlite3_close(db);
+10
+实时动态库存需求预测分析平台 v1.0
+ sqlite3_finalize(stmt);
+ return {};
+ }
+ // 提取查询结果
+ double demand = sqlite3_column_double(stmt, 0);
+ const unsigned char* suggestion_text = sqlite3_column_text(stmt, 1);
+ std::string suggestion(suggestion_text, suggestion_text + sqlite3_column_bytes(stmt, 1));
+ prediction_data["predicted_demand"] = demand;
+ prediction_data["inventory_suggestion"] = suggestion;
+ sqlite3_close(db);
+ sqlite3_finalize(stmt);
+ return prediction_data;
+}
+#include <SQLiteCpp/SQLiteCpp.h>
+#include <stdexcept>
+#include <string>
+#include <memory>
+#include <cstdint>
+#include <iostream>
+namespace inventory_service {
+ enum class HttpStatusCode {
+ OK = 200,
+ NOT_FOUND = 404,
+ CONFLICT = 409,
+ INTERNAL_SERVER_ERROR = 500
+ };
+ int deleteInventoryRecord(const std::string& inventoryId) {
+ // Validate inventory ID is not empty
+ if (inventoryId.empty()) {
+ return static_cast<int>(HttpStatusCode::NOT_FOUND);
+ }
+ // Initialize database connection
+ try {
+ std::unique_ptr<SQLite::Database> db(new SQLite::Database("inventory.db", SQLite::OPEN_READWRITE | 
+SQLite::OPEN_CREATE));
+ if (!db->isOpen()) {
+ return static_cast<int>(HttpStatusCode::INTERNAL_SERVER_ERROR);
+ }
+ // Check if inventory record exists
+ SQLite::Statement stmtExist(*db, "SELECT COUNT(*) FROM inventory WHERE id = ?");
+ stmtExist.bind(1, inventoryId);
+ int count = stmtExist.getColumn(0);
+ if (count == 0) {
+ return static_cast<int>(HttpStatusCode::NOT_FOUND);
+ }
+ // Check if inventory is referenced by any orders
+ SQLite::Statement stmtRef(*db, "SELECT COUNT(*) FROM orders WHERE inventory_id = ?");
+ stmtRef.bind(1, inventoryId);
+ int refCount = stmtRef.getColumn(0);
+ if (refCount > 0) {
+11
+实时动态库存需求预测分析平台 v1.0
+ return static_cast<int>(HttpStatusCode::CONFLICT);
+ }
+ // Begin transaction for atomic operation
+ db->exec("BEGIN TRANSACTION");
+ // Execute deletion
+ SQLite::Statement stmtDelete(*db, "DELETE FROM inventory WHERE id = ?");
+ stmtDelete.bind(1, inventoryId);
+ if (!stmtDelete.exec()) {
+ db->exec("ROLLBACK");
+ return static_cast<int>(HttpStatusCode::INTERNAL_SERVER_ERROR);
+ }
+ // Commit transaction
+ db->exec("COMMIT");
+ return static_cast<int>(HttpStatusCode::OK);
+ } catch (const SQLite::Exception& e) {
+ // Log error using system logging framework
+ std::cerr << "SQLite database error: " << e.what() << std::endl;
+ return static_cast<int>(HttpStatusCode::INTERNAL_SERVER_ERROR);
+ } catch (const std::exception& e) {
+ // Log unexpected error using system logging framework
+ std::cerr << "Unexpected error: " << e.what() << std::endl;
+ return static_cast<int>(HttpStatusCode::INTERNAL_SERVER_ERROR);
+ }
+ }
+} // namespace inventory_service
+#include <string>
+#include <vector>
+#include <optional>
+#include <stdexcept>
+#include <iostream>
+#include <soci/soci.h>
+#include <regex>
+// 库存记录结构体，包含产品 ID、仓库位置、入库日期和库存数量
+struct InventoryRecord {
+ int product_id; // 产品唯一标识符
+ std::string warehouse; // 仓库位置
+ std::string entry_date; // 入库日期
+ int quantity; // 库存数量
+};
+// 校验日期格式是否符合 YYYY-MM-DD 要求
+bool isValidDate(const std::string& date) {
+ std::regex date_regex("^\\d{4}-\\d{2}-\\d{2}$");
+ return std::regex_match(date, date_regex);
+}
+// 根据产品名称查询库存记录，支持仓库位置和入库日期筛选
+std::vector<InventoryRecord> queryInventoryByProduct(const std::string& product_name, const std::optional<std::string>& 
+warehouse, const std::optional<std::string>& entry_date) {
+ // 验证产品名称不能为空
+ if (product_name.empty()) {
+ throw std::invalid_argument("Product name cannot be empty");
+12
+实时动态库存需求预测分析平台 v1.0
+ }
+ try {
+ // 初始化数据库连接，使用 SQLite 示例
+ soci::session sql(soci::sqlite3, "inventory.db");
+ // 构建 SQL 查询语句
+ std::string query = "SELECT product_id, warehouse, entry_date, quantity FROM inventory WHERE product_name 
+= :product_name";
+ // 添加仓库筛选条件
+ if (warehouse.has_value()) {
+ query += " AND warehouse = :warehouse";
+ }
+ // 添加日期筛选条件
+ if (entry_date.has_value()) {
+ if (!isValidDate(entry_date.value())) {
+ throw std::invalid_argument("Invalid date format for entry_date");
+ }
+ query += " AND entry_date = :entry_date";
+ }
+ // 准备并执行 SQL 查询
+ soci::statement stmt = (sql.prepare << query);
+ stmt << product_name;
+ // 如果提供仓库参数，绑定仓库值
+ if (warehouse.has_value()) {
+ stmt << warehouse.value();
+ }
+ // 如果提供日期参数，绑定日期值
+ if (entry_date.has_value()) {
+ stmt << entry_date.value();
+ }
+ // 获取查询结果集
+ std::vector<InventoryRecord> result;
+ stmt.execute();
+ soci::rowset<soci::row> rows = stmt.get_rowset();
+ // 解析结果行并填充数据结构
+ for (const soci::row& row : rows) {
+ InventoryRecord record;
+ record.product_id = row.get<int>("product_id");
+ record.warehouse = row.get<std::string>("warehouse");
+ record.entry_date = row.get<std::string>("entry_date");
+ record.quantity = row.get<int>("quantity");
+ result.push_back(record);
+ }
+ return result;
+ } catch (const std::exception& e) {
+ // 记录错误日志到标准错误流
+ std::cerr << "Database error: " << e.what() << std::endl;
+ throw std::runtime_error("Database operation failed: " + std::string(e.what()));
+ } catch (...) {
+ // 记录未知错误日志到标准错误流
+ std::cerr << "Unknown error occurred during database query" << std::endl;
+13
+实时动态库存需求预测分析平台 v1.0
+ throw std::runtime_error("An unknown error occurred during database query");
+ }
+}
+#include <string>
+#include <stdexcept>
+#include <ctime>
+#include <sqlite3.h>
+#include <iostream>
+enum class InventoryStatus {
+ InStock,
+ OutOfStock,
+ Reserved
+};
+struct InventoryRecord {
+ int id;
+ std::string product_name;
+ std::string warehouse_location;
+ int quantity;
+ time_t entry_date;
+ InventoryStatus status;
+ int remaining_shelf_life;
+};
+int createInventoryRecord(const std::string& product_name, const std::string& warehouse_location, int quantity, time_t 
+entry_date, InventoryStatus status, int remaining_shelf_life) {
+ // 参数校验
+ if (product_name.empty()) {
+ // 记录错误日志
+ std::cerr << "产品名称不能为空" << std::endl;
+ return 400;
+ }
+ if (quantity < 0) {
+ // 记录错误日志
+ std::cerr << "库存数量不能为负数" << std::endl;
+ return 400;
+ }
+ if (status != InventoryStatus::InStock && status != InventoryStatus::OutOfStock && status != InventoryStatus::Reserved) {
+ // 记录错误日志
+ std::cerr << "无效的库存状态" << std::endl;
+ return 400;
+ }
+ if (remaining_shelf_life < 0) {
+ // 记录错误日志
+ std::cerr << "剩余保质期不能为负数" << std::endl;
+ return 400;
+ }
+ // 获取默认数据库连接
+ sqlite3* db;
+ int rc = sqlite3_open(":memory:", &db);
+ if (rc != SQLITE_OK) {
+ // 记录错误日志
+14
+实时动态库存需求预测分析平台 v1.0
+ std::cerr << "未能打开数据库连接: " << sqlite3_errmsg(db) << std::endl;
+ sqlite3_close(db);
+ return 500;
+ }
+ // 创建库存记录表（如果不存在）
+ const char* create_table_sql = "CREATE TABLE IF NOT EXISTS inventory_records (id INTEGER PRIMARY KEY 
+AUTOINCREMENT, product_name TEXT, warehouse_location TEXT, quantity INTEGER, entry_date INTEGER, status INTEGER, 
+remaining_shelf_life INTEGER);";
+ rc = sqlite3_exec(db, create_table_sql, nullptr, nullptr, nullptr);
+ if (rc != SQLITE_OK) {
+ // 记录错误日志
+ std::cerr << "未能创建库存记录表: " << sqlite3_errmsg(db) << std::endl;
+ sqlite3_close(db);
+ return 500;
+ }
+ // 准备 SQL 语句
+ std::string sql = "INSERT INTO inventory_records (product_name, warehouse_location, quantity, entry_date, status, 
+remaining_shelf_life) VALUES (?, ?, ?, ?, ?, ?)";
+ sqlite3_stmt* stmt;
+ rc = sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
+ if (rc != SQLITE_OK) {
+ // 记录错误日志
+ std::cerr << "未能准备 SQL 语句: " << sqlite3_errmsg(db) << std::endl;
+ sqlite3_close(db);
+ return 500;
+ }
+ // 绑定参数到 SQL 语句
+ sqlite3_bind_text(stmt, 1, product_name.c_str(), -1, SQLITE_TRANSIENT);
+ sqlite3_bind_text(stmt, 2, warehouse_location.c_str(), -1, SQLITE_TRANSIENT);
+ sqlite3_bind_int(stmt, 3, quantity);
+ sqlite3_bind_int64(stmt, 4, static_cast<int64_t>(entry_date));
+ sqlite3_bind_int(stmt, 5, static_cast<int>(status));
+ sqlite3_bind_int(stmt, 6, remaining_shelf_life);
+ // 执行插入操作
+ rc = sqlite3_step(stmt);
+ if (rc != SQLITE_DONE) {
+ // 记录错误日志
+ std::cerr << "插入库存记录失败: " << sqlite3_errmsg(db) << std::endl;
+ sqlite3_finalize(stmt);
+ sqlite3_close(db);
+ return 500;
+ }
+ // 关闭 SQL 语句和数据库连接
+ sqlite3_finalize(stmt);
+ sqlite3_close(db);
+ // 返回成功状态码
+ return 200;
+}
+#include <stdexcept>
+#include <vector>
+15
+实时动态库存需求预测分析平台 v1.0
+#include <string>
+#include <Poco/Data/Session.h>
+#include <Poco/Data/SQLite/SQLiteConnector.h>
+#include <Poco/Data/SQLite/SQLiteException.h>
+#include <Poco/Data/Statement.h>
+#include <Poco/Data/RecordSet.h>
+#include <Poco/Logger.h>
+// 定义库存预警数据结构
+struct InventoryAlert {
+ std::string product_name; // 产品名称
+ std::string warehouse_location; // 仓库位置
+ int days_remaining; // 剩余保质期
+ int current_stock; // 当前库存数量
+};
+// 获取即将过期的库存预警信息
+std::vector<InventoryAlert> getInventoryExpiryAlert(const int expiry_threshold) {
+ // 参数校验
+ if (expiry_threshold < 0) {
+ throw std::invalid_argument("Expiry threshold must be non-negative.");
+ }
+ // 初始化数据库连接
+ try {
+ Poco::Data::SQLite::SQLiteConnector::registerSQLite();
+ Poco::Data::Session session(Poco::Data::SQLite::SQLiteConnection::open("inventory.db"));
+ // 构造查询语句
+ Poco::Data::Statement stmt(session);
+ stmt << "SELECT product_name, warehouse_location, days_remaining, current_stock FROM inventory WHERE 
+days_remaining <= ? ORDER BY days_remaining ASC", use expiry_threshold;
+ // 执行查询并获取结果
+ Poco::Data::RecordSet rs(stmt);
+ std::vector<InventoryAlert> alerts;
+ while (rs.next()) {
+ InventoryAlert alert;
+ rs >> alert.product_name >> alert.warehouse_location >> alert.days_remaining >> alert.current_stock;
+ alerts.push_back(alert);
+ }
+ return alerts;
+ } 
+ // 捕获数据库异常
+ catch (const Poco::Data::SQLite::SQLiteException& e) {
+ Poco::Logger::get().error("SQLite operation failed: " + std::string(e.displayText()));
+ throw std::runtime_error("Database error occurred.");
+ } 
+ // 捕获其他异常
+ catch (const std::exception& e) {
+ Poco::Logger::get().error("General exception: " + std::string(e.what()));
+ throw std::runtime_error("An unexpected error occurred.");
+ }
+}
+#include <string>
+16
+实时动态库存需求预测分析平台 v1.0
+#include <stdexcept>
+#include <sqlite3.h>
+#include <sstream>
+#include <vector>
+#include <ctime>
+std::string updateInventoryStatus(int inventoryId, const std::string& newStatus, const std::string& changeTime) {
+ // Validate inventory ID
+ if (inventoryId <= 0) {
+ throw std::invalid_argument("Inventory ID must be a positive integer.");
+ }
+ // Validate status
+ std::vector<std::string> validStatuses = {"Normal", "NearExpiry", "Expired"};
+ if (std::find(validStatuses.begin(), validStatuses.end(), newStatus) == validStatuses.end()) {
+ throw std::domain_error("Invalid status. Allowed values are: Normal, NearExpiry, Expired.");
+ }
+ // Validate change time format
+ std::tm tmChangeTime = {};
+ std::istringstream iss(changeTime);
+ iss >> std::get_time(&tmChangeTime, "%Y-%m-%d %H:%M:%S");
+ if (iss.fail()) {
+ throw std::invalid_argument("Invalid change time format. Expected ISO 8601 format.");
+ }
+ // Open database connection
+ sqlite3* db = nullptr;
+ int result = sqlite3_open("inventory.db", &db);
+ if (result != SQLITE_OK) {
+ throw std::runtime_error("Failed to connect to database: " + std::string(sqlite3_errmsg(db)));
+ }
+ // Prepare SQL statement
+ sqlite3_stmt* stmt = nullptr;
+ result = sqlite3_prepare_v2(db, "UPDATE inventory SET status = ?, change_time = ? WHERE id = ?", -1, &stmt, nullptr);
+ if (result != SQLITE_OK) {
+ throw std::runtime_error("Failed to prepare SQL statement: " + std::string(sqlite3_errmsg(db)));
+ }
+ // Bind parameters
+ result = sqlite3_bind_text(stmt, 1, newStatus.c_str(), -1, SQLITE_TRANSIENT);
+ if (result != SQLITE_OK) {
+ throw std::runtime_error("Failed to bind status parameter: " + std::string(sqlite3_errmsg(db)));
+ }
+ result = sqlite3_bind_text(stmt, 2, changeTime.c_str(), -1, SQLITE_TRANSIENT);
+ if (result != SQLITE_OK) {
+ throw std::runtime_error("Failed to bind change time parameter: " + std::string(sqlite3_errmsg(db)));
+ }
+ result = sqlite3_bind_int(stmt, 3, inventoryId);
+ if (result != SQLITE_OK) {
+ throw std::runtime_error("Failed to bind inventory ID parameter: " + std::string(sqlite3_errmsg(db)));
+ }
+ // Execute update
+ result = sqlite3_step(stmt);
+ if (result != SQLITE_DONE) {
+17
+实时动态库存需求预测分析平台 v1.0
+ throw std::runtime_error("Database operation failed: " + std::string(sqlite3_errmsg(db)));
+ }
+ // Finalize statement and close connection
+ sqlite3_finalize(stmt);
+ sqlite3_close(db);
+ return "Inventory status updated successfully.";
+}
+#include <vector>
+#include <string>
+#include <stdexcept>
+#include <SQLiteCpp/SQLiteCpp.h>
+struct InventoryRecord {
+ std::string product_name; // 产品名称
+ std::string warehouse_location; // 仓库位置
+ std::string inbound_date; // 入库日期
+ int quantity; // 库存数量
+};
+std::vector<InventoryRecord> listAllInventoryRecords(
+ const std::string& sort_by, 
+ const std::string& sort_order, 
+ int page, 
+ int per_page) {
+ // 参数校验
+ if (sort_by != "product_name" && sort_by != "warehouse_location" && sort_by != "inbound_date") {
+ throw std::invalid_argument("Invalid sort_by parameter");
+ }
+ if (sort_order != "asc" && sort_order != "desc") {
+ throw std::invalid_argument("Invalid sort_order parameter");
+ }
+ if (page < 1) {
+ throw std::invalid_argument("Page number must be at least 1");
+ }
+ if (per_page < 1) {
+ throw std::invalid_argument("Per_page must be at least 1");
+ }
+ // 获取数据库连接
+ try {
+ SQLite::Database db("inventory.db", SQLite::OPEN_READONLY | SQLite::OPEN_CREATE);
+ if (!db.isOpen()) {
+ throw std::runtime_error("无法打开数据库");
+ }
+ // 构建查询语句
+ std::string query = "SELECT * FROM inventory_records ";
+ if (!sort_by.empty()) {
+ query += "ORDER BY " + sort_by + " " + sort_order + " ";
+ }
+ query += "LIMIT " + std::to_string(per_page) + " OFFSET " + std::to_string((page - 1) * per_page);
+ // 执行查询并获取结果
+ std::vector<InventoryRecord> records;
+ SQLite::Statement stmt(db, query);
+18
+实时动态库存需求预测分析平台 v1.0
+ while (stmt.executeStep()) {
+ InventoryRecord record;
+ record.product_name = stmt.getColumn(0).getText();
+ record.warehouse_location = stmt.getColumn(1).getText();
+ record.inbound_date = stmt.getColumn(2).getText();
+ record.quantity = stmt.getColumn(3).getInt();
+ records.push_back(record);
+ }
+ return records;
+ } catch (const std::exception& e) {
+ // 记录错误日志
+ throw std::runtime_error("数据库操作失败: " + std::string(e.what()));
+ }
+}
+#include <sqlite3.h>
+#include <stdexcept>
+#include <string>
+#include <tuple>
+#include <memory>
+// 定义课程数据结构体
+struct CourseMeta {
+ int id;
+ std::string date; // 课程日期
+ int demand; // 需求量
+ int stock; // 库存量
+ std::string trend; // 趋势
+ std::string region; // 区域
+ double satisfaction; // 客户满意度
+};
+// 创建课程记录
+std::pair<int, CourseMeta> create_course(const std::string& date, int demand, int stock, const std::string& trend, const 
+std::string& region, double satisfaction) {
+ // 参数校验
+ if (date.empty()) {
+ throw std::invalid_argument("Date cannot be empty");
+ }
+ if (demand < 0) {
+ throw std::invalid_argument("Demand must be non-negative");
+ }
+ if (stock < 0) {
+ throw std::invalid_argument("Stock must be non-negative");
+ }
+ if (satisfaction < 0.0 || satisfaction > 1.0) {
+ throw std::invalid_argument("Satisfaction must be between 0 and 1");
+ }
+ // 初始化数据库连接
+ std::unique_ptr<sqlite3, decltype(&sqlite3_close)> db(nullptr, &sqlite3_close);
+ int rc = sqlite3_open("courses.db", db.get());
+ if (rc != SQLITE_OK) {
+ throw std::runtime_error("Failed to connect to database");
+19
+实时动态库存需求预测分析平台 v1.0
+ }
+ // 准备 SQL 语句
+ std::string sql = "INSERT INTO courses (date, demand, stock, trend, region, satisfaction) VALUES (?, ?, ?, ?, ?, ?)";
+ sqlite3_stmt* stmt = nullptr;
+ rc = sqlite3_prepare_v2(db.get(), sql.c_str(), -1, &stmt, nullptr);
+ if (rc != SQLITE_OK) {
+ throw std::runtime_error("Failed to prepare SQL statement");
+ }
+ // 绑定参数
+ sqlite3_bind_text(stmt, 1, date.c_str(), -1, SQLITE_TRANSIENT);
+ sqlite3_bind_int(stmt, 2, demand);
+ sqlite3_bind_int(stmt, 3, stock);
+ sqlite3_bind_text(stmt, 4, trend.c_str(), -1, SQLITE_TRANSIENT);
+ sqlite3_bind_text(stmt, 5, region.c_str(), -1, SQLITE_TRANSIENT);
+ sqlite3_bind_double(stmt, 6, satisfaction);
+ // 执行插入
+ rc = sqlite3_step(stmt);
+ if (rc != SQLITE_DONE) {
+ throw std::runtime_error("Failed to insert course record");
+ }
+ // 获取生成的 ID
+ int course_id = sqlite3_last_insert_rowid(db.get());
+ // 释放资源
+ sqlite3_finalize(stmt);
+ // 构造返回值
+ CourseMeta course;
+ course.id = course_id;
+ course.date = date;
+ course.demand = demand;
+ course.stock = stock;
+ course.trend = trend;
+ course.region = region;
+ course.satisfaction = satisfaction;
+ return {course_id, course};
+}
+#include <Poco/Data/Session.h>
+#include <Poco/Data/MySQL/Connector.h>
+#include <Poco/Data/SQLite/Connector.h>
+#include <Poco/DateTime.h>
+#include <Poco/Exception.h>
+#include <Poco/InvalidArgumentException.h>
+#include <Poco/Logger.h>
+#include <vector>
+#include <string>
+#include <stdexcept>
+// 定义课程信息结构体，包含需求量、库存量、趋势、区域、客户满意度等属性
+struct Course {
+ std::string date; // 查询日期
+ int demand; // 需求量
+ int stock; // 库存量
+20
+实时动态库存需求预测分析平台 v1.0
+ double trend; // 趋势值
+ std::string region; // 所属区域
+ double customerSatisfaction; // 客户满意度
+};
+// 根据指定日期查询课程信息，返回该日期下的所有课程数据
+std::vector<Course> queryCourseByDate(const std::string& date) {
+ // 参数校验：检查日期格式是否有效
+ try {
+ Poco::DateTime::parseString(date.c_str(), "%Y-%m-%d");
+ } catch (...) {
+ Poco::Logger::get("CourseLogger").error("日期格式无效");
+ throw std::invalid_argument("日期格式必须为 YYYY-MM-DD");
+ }
+ // 初始化数据库连接
+ std::vector<Course> result_courses;
+ try {
+ // 注册 SQLite 数据库驱动
+ Poco::Data::SQLite::Connector::registerConnector();
+ Poco::Data::Session session("SQLite", "path/to/course_database.db");
+ // 构造 SQL 查询语句
+ std::string query = "SELECT * FROM course_data WHERE date = ?";
+ Poco::Data::Statement stmt(session);
+ stmt << query, Poco::Data::Keywords::into(stmt);
+ // 执行查询并获取数据
+ stmt.bind(1, date);
+ Poco::Data::Statement::Result result = stmt.execute();
+ // 解析结果集到 Course 结构体
+ while (result.next()) {
+ Course course;
+ course.date = result.data<std::string>("date");
+ course.demand = result.data<int>("demand");
+ course.stock = result.data<int>("stock");
+ course.trend = result.data<double>("trend");
+ course.region = result.data<std::string>("region");
+ course.customerSatisfaction = result.data<double>("customer_satisfaction");
+ result_courses.push_back(course);
+ }
+ } catch (const Poco::Exception& e) {
+ Poco::Logger::get("CourseLogger").error("数据库连接或查询失败");
+ throw std::runtime_error("数据库操作异常: " + std::string(e.what()));
+ } catch (const std::exception& e) {
+ Poco::Logger::get("CourseLogger").error("系统错误");
+ throw;
+ }
+ // 返回查询结果
+ return result_courses;
+}
+#include <sqlite3.h>
+#include <map>
+#include <string>
+21
+实时动态库存需求预测分析平台 v1.0
+#include <stdexcept>
+#include <sstream>
+#include <ctime>
+#include <iomanip>
+std::pair<double, std::map<std::string, std::string>> calculate_satisfaction_rate(int course_id, const std::string& date) {
+ // 参数校验
+ if (course_id <= 0) {
+ throw std::invalid_argument("课程 ID 必须为正整数");
+ }
+ if (date.length() != 10 || date.find('-') == std::string::npos) {
+ throw std::invalid_argument("日期必须符合 YYYY-MM-DD 格式");
+ }
+ // 检查日期格式是否正确
+ std::tm tm = {};
+ std::istringstream iss(date);
+ iss >> std::get_time(&tm, "%Y-%m-%d");
+ if (iss.fail()) {
+ throw std::invalid_argument("日期格式无效");
+ }
+ // 获取默认数据库连接
+ sqlite3* db;
+ int rc = sqlite3_open("inventory.db", &db);
+ if (rc != SQLITE_OK) {
+ std::cerr << "打开数据库失败: " << sqlite3_errmsg(db) << std::endl;
+ sqlite3_close(db);
+ return {0.0, {}};
+ }
+ // 准备数据库查询语句
+ std::string sql = "SELECT demand, stock FROM course_inventory WHERE course_id = ? AND date = ?";
+ sqlite3_stmt* stmt;
+ rc = sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
+ if (rc != SQLITE_OK) {
+ std::cerr << "准备 SQL 语句失败: " << sqlite3_errmsg(db) << std::endl;
+ sqlite3_close(db);
+ return {0.0, {}};
+ }
+ // 绑定课程 ID 参数到 SQL 查询
+ rc = sqlite3_bind_int(stmt, 1, course_id);
+ if (rc != SQLITE_OK) {
+ std::cerr << "绑定课程 ID 参数失败: " << sqlite3_errmsg(db) << std::endl;
+ sqlite3_finalize(stmt);
+ sqlite3_close(db);
+ return {0.0, {}};
+ }
+ // 绑定日期参数到 SQL 查询
+ rc = sqlite3_bind_text(stmt, 2, date.c_str(), static_cast<int>(date.size()), SQLITE_STATIC);
+ if (rc != SQLITE_OK) {
+ std::cerr << "绑定日期参数失败: " << sqlite3_errmsg(db) << std::endl;
+ sqlite3_finalize(stmt);
+ sqlite3_close(db);
+22
+实时动态库存需求预测分析平台 v1.0
+ return {0.0, {}};
+ }
+ // 执行查询
+ int result = sqlite3_step(stmt);
+ if (result != SQLITE_ROW) {
+ std::cerr << "未找到课程 ID 为 " << course_id << " 且日期为 " << date << " 的数据" << std::endl;
+ sqlite3_finalize(stmt);
+ sqlite3_close(db);
+ return {0.0, {}};
+ }
+ // 提取需求量和库存量
+ int demand = sqlite3_column_int(stmt, 0);
+ int stock = sqlite3_column_int(stmt, 1);
+ // 计算客户满意度评分
+ double satisfaction_rate = 0.0;
+ if (demand > 0) {
+ satisfaction_rate = static_cast<double>(stock) / demand * 100.0;
+ }
+ // 准备元数据返回
+ std::map<std::string, std::string> metadata;
+ metadata["course_id"] = std::to_string(course_id);
+ metadata["date"] = date;
+ metadata["demand"] = std::to_string(demand);
+ metadata["stock"] = std::to_string(stock);
+ metadata["calculated_at"] = std::to_string(static_cast<long long>(std::time(nullptr)));
+ // 释放数据库资源
+ sqlite3_finalize(stmt);
+ sqlite3_close(db);
+ return {satisfaction_rate, metadata};
+}
+#include <map>
+#include <variant>
+#include <string>
+#include <stdexcept>
+#include <sqlite3.h>
+#include "spdlog/spdlog.h"
+namespace inventory {
+ // Validate that the date string follows the format "YYYY-MM-DD"
+ bool isValidDate(const std::string& date_str) {
+ std::tm tm = {};
+ std::istringstream iss(date_str);
+ iss >> std::get_time(&tm, "%Y-%m-%d");
+ return iss.eof() && !iss.fail();
+ }
+ // Fetch course inventory data for a specific course ID and date
+ std::map<std::string, std::variant<int, std::string>> get_course_inventory(int courseId, const std::string& date) {
+ // Validate course ID
+ if (courseId <= 0) {
+ spdlog::error("Invalid course ID. Must be a positive integer.");
+ throw std::invalid_argument("Course ID must be a positive integer.");
+23
+实时动态库存需求预测分析平台 v1.0
+ }
+ // Validate date format
+ if (!isValidDate(date)) {
+ spdlog::error("Invalid date format. Expected 'YYYY-MM-DD'.");
+ throw std::invalid_argument("Invalid date format.");
+ }
+ // Open database connection
+ sqlite3* db;
+ int result = sqlite3_open("inventory.db", &db);
+ if (result != SQLITE_OK) {
+ spdlog::error("Failed to open database: {}", sqlite3_errmsg(db));
+ throw std::runtime_error("Failed to open database.");
+ }
+ // Prepare SQL query to fetch inventory and course metadata
+ std::string query = R"(
+ SELECT 
+ course_inventory.quantity, 
+ courses.id, 
+ courses.name, 
+ courses.description, 
+ courses.price 
+ FROM courses 
+ JOIN course_inventory ON courses.id = course_inventory.course_id 
+ WHERE course_inventory.date = ? AND course_inventory.course_id = ?
+ )";
+ sqlite3_stmt* stmt;
+ result = sqlite3_prepare_v2(db, query.c_str(), -1, &stmt, nullptr);
+ if (result != SQLITE_OK) {
+ spdlog::error("Failed to prepare statement: {}", sqlite3_errmsg(db));
+ sqlite3_close(db);
+ throw std::runtime_error("Failed to prepare SQL statement.");
+ }
+ // Bind query parameters
+ result = sqlite3_bind_text(stmt, 1, date.c_str(), -1, SQLITE_TRANSIENT);
+ result = sqlite3_bind_int(stmt, 2, courseId);
+ if (result != SQLITE_OK) {
+ spdlog::error("Failed to bind parameters: {}", sqlite3_errmsg(db));
+ sqlite3_finalize(stmt);
+ sqlite3_close(db);
+ throw std::runtime_error("Failed to bind SQL parameters.");
+ }
+ // Execute query
+ result = sqlite3_step(stmt);
+ if (result != SQLITE_ROW) {
+ spdlog::debug("No inventory data found for course {} on date {}.", courseId, date);
+ sqlite3_finalize(stmt);
+ sqlite3_close(db);
+ return {};
+ }
+ // Extract and construct inventory data map
+24
+实时动态库存需求预测分析平台 v1.0
+ std::map<std::string, std::variant<int, std::string>> inventory_data;
+ inventory_data["quantity"] = sqlite3_column_int(stmt, 0);
+ inventory_data["id"] = sqlite3_column_int(stmt, 1);
+ inventory_data["name"] = std::string(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2)));
+ inventory_data["description"] = std::string(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3)));
+ inventory_data["price"] = sqlite3_column_double(stmt, 4);
+ // Clean up resources
+ sqlite3_finalize(stmt);
+ sqlite3_close(db);
+ return inventory_data;
+ }
+} // namespace inventory
+#include <sqlite_orm/sqlite_orm.h>
+#include <spdlog/spdlog.h>
+#include <stdexcept>
+#include <string>
+#include <map>
+#include <regex>
+// 定义基础错误类型
+class InvalidArgumentError : public std::runtime_error {
+public:
+ explicit InvalidArgumentError(const std::string& message) : std::runtime_error(message) {}
+};
+class DatabaseError : public std::runtime_error {
+public:
+ explicit DatabaseError(const std::string& message) : std::runtime_error(message) {}
+};
+// 定义课程需求数据结构
+struct CourseDemand {
+ int course_id; // 课程唯一标识符
+ std::string date; // 需求记录日期（YYYY-MM-DD 格式）
+ int demand; // 需求量值
+};
+// 数据库操作函数
+std::map<std::string, std::string> update_course_demand(int course_id, const std::string& date, int new_demand) {
+ try {
+ // 参数校验
+ if (course_id <= 0) {
+ throw InvalidArgumentError("course_id must be a positive integer");
+ }
+ if (!std::regex_match(date, std::regex(R"(\d{4}-\d{2}-\d{2})"))) {
+ throw InvalidArgumentError("date must be in YYYY-MM-DD format");
+ }
+ if (new_demand < 0) {
+ throw InvalidArgumentError("new_demand must be a non-negative integer");
+ }
+ // 获取并验证数据库连接
+ connection db("retail.db");
+ if (!db.is_open()) {
+ throw DatabaseError("Failed to open database connection");
+25
+实时动态库存需求预测分析平台 v1.0
+ }
+ // 业务逻辑：更新或插入课程需求数据
+ CourseDemand updated_demand{course_id, date, new_demand};
+ auto query_result = db.select<CourseDemand>(where(c(&CourseDemand::course_id) == course_id && 
+d(&CourseDemand::date) == date));
+ if (query_result.size() > 0) {
+ // 如果存在已有记录，执行更新
+ db.update(updated_demand);
+ } else {
+ // 如果没有记录，执行插入
+ db.insert(updated_demand);
+ }
+ // 事务提交
+ db.commit();
+ // 返回更新后的元数据
+ std::map<std::string, std::string> metadata;
+ metadata["course_id"] = std::to_string(course_id);
+ metadata["date"] = date;
+ metadata["demand"] = std::to_string(new_demand);
+ metadata["status"] = "success";
+ return metadata;
+ } catch (const InvalidArgumentError& e) {
+ spdlog::error("Invalid argument: {}", e.what());
+ return {};
+ } catch (const DatabaseError& e) {
+ spdlog::error("Database error: {}", e.what());
+ return {};
+ } catch (const std::exception& e) {
+ spdlog::error("Unexpected error: {}", e.what());
+ return {};
+ }
+}
+#include <sqlite3.h>
+#include <vector>
+#include <stdexcept>
+#include <string>
+#include <sstream>
+#include <iomanip>
+#include <cmath>
+#include <stdexcept>
+#include <iostream>
+#include <mutex>
+// 定义趋势分析结果结构体
+struct TrendAnalysisResult {
+ std::string region_id; // 区域 ID
+ std::string analysis_period; // 分析时间段
+ double average_demand; // 平均需求量
+ double max_demand; // 最大需求量
+ double min_demand; // 最小需求量
+ double inventory_fluctuation_rate; // 库存波动率
+26
+实时动态库存需求预测分析平台 v1.0
+ int total_course_days; // 课程天数总数
+ int valid_data_points; // 有效数据点
+};
+// 区域趋势分析函数
+TrendAnalysisResult analyze_trend_for_region(const std::string& region_id, const std::string& start_date, const std::string& 
+end_date) {
+ // 参数有效性检查
+ if (region_id.empty()) {
+ throw std::invalid_argument("区域 ID 不能为空");
+ }
+ if (start_date > end_date) {
+ throw std::invalid_argument("开始日期必须早于结束日期");
+ }
+ // 日期格式校验(YYYY-MM-DD)
+ std::istringstream iss_start(start_date);
+ std::istringstream iss_end(end_date);
+ if (!(iss_start >> std::get_time(nullptr, "%Y-%m-%d")) || 
+ !(iss_end >> std::get_time(nullptr, "%Y-%m-%d"))) {
+ throw std::invalid_argument("日期格式不正确，应为 YYYY-MM-DD");
+ }
+ // 数据库连接初始化
+ sqlite3* db;
+ int rc = sqlite3_open("courses.db", &db);
+ if (rc != SQLITE_OK) {
+ std::cerr << "数据库打开失败: " << sqlite3_errmsg(db) << std::endl;
+ sqlite3_close(db);
+ throw std::runtime_error("数据库连接异常");
+ }
+ // SQL 查询语句
+ std::string query = 
+ "SELECT timestamp, demand, inventory FROM courses "
+ "WHERE region_id = ? AND timestamp BETWEEN ? AND ? "
+ "ORDER BY timestamp ASC";
+ sqlite3_stmt* stmt;
+ rc = sqlite3_prepare_v2(db, query.c_str(), -1, &stmt, nullptr);
+ if (rc != SQLITE_OK) {
+ std::cerr << "SQL 语句准备失败: " << sqlite3_errmsg(db) << std::endl;
+ sqlite3_close(db);
+ throw std::runtime_error("SQL 解析异常");
+ }
+ // 参数绑定
+ sqlite3_bind_text(stmt, 1, region_id.c_str(), -1, SQLITE_TRANSIENT);
+ sqlite3_bind_text(stmt, 2, start_date.c_str(), -1, SQLITE_TRANSIENT);
+ sqlite3_bind_text(stmt, 3, end_date.c_str(), -1, SQLITE_TRANSIENT);
+ // 查询执行与数据解析
+ std::vector<double> demand_values;
+ std::vector<double> inventory_values;
+ std::vector<std::string> timestamps;
+ int rows = 0;
+ while (sqlite3_step(stmt) == SQLITE_ROW) {
+27
+实时动态库存需求预测分析平台 v1.0
+ timestamps.emplace_back(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0)));
+ demand_values.emplace_back(sqlite3_column_double(stmt, 1));
+ inventory_values.emplace_back(sqlite3_column_double(stmt, 2));
+ rows++;
+ }
+ // 清理资源
+ sqlite3_finalize(stmt);
+ sqlite3_close(db);
+ // 校验数据完整性
+ if (rows == 0) {
+ throw std::runtime_error("该时间段内没有相关课程数据");
+ }
+ // 计算统计数据
+ double sum_demand = 0.0;
+ for (const auto& val : demand_values) {
+ sum_demand += val;
+ }
+ double average_demand = sum_demand / rows;
+ double max_demand = *std::max_element(demand_values.begin(), demand_values.end());
+ double min_demand = *std::min_element(demand_values.begin(), demand_values.end());
+ double max_inventory = *std::max_element(inventory_values.begin(), inventory_values.end());
+ double min_inventory = *std::min_element(inventory_values.begin(), inventory_values.end());
+ double inventory_fluctuation = (max_inventory - min_inventory) / average_demand;
+ // 构建趋势报告
+ TrendAnalysisResult result;
+ result.region_id = region_id;
+ result.analysis_period = start_date + " 至 " + end_date;
+ result.average_demand = average_demand;
+ result.max_demand = max_demand;
+ result.min_demand = min_demand;
+ result.inventory_fluctuation_rate = std::abs(inventory_fluctuation);
+ result.total_course_days = timestamps.size();
+ result.valid_data_points = rows;
+ return result;
+}
+#include <iostream>
+#include <string>
+#include <vector>
+#include <stdexcept>
+// 定义库存调整记录更新函数
+int update_stockAdjustment(const std::string& adjustmentId, const std::string& adjustmentStrategy, int stockChange, double 
+expectedBenefit, const std::string& status) {
+ // 参数校验：检查调整 ID 是否有效
+ if (adjustmentId.empty()) {
+ std::cerr << "Error: Adjustment ID is empty." << std::endl;
+ return -1;
+ }
+ // 参数校验：检查库存变动是否为非负数
+ if (stockChange < 0) {
+ std::cerr << "Error: Stock change must be non-negative." << std::endl;
+28
+实时动态库存需求预测分析平台 v1.0
+ return -1;
+ }
+ // 参数校验：检查预计效益是否为有效数值
+ if (expectedBenefit < 0) {
+ std::cerr << "Error: Expected benefit must be non-negative." << std::endl;
+ return -1;
+ }
+ // 获取默认数据库连接
+ auto dbConnection = get_default_db_connection();
+ if (!dbConnection) {
+ std::cerr << "Error: Failed to establish database connection." << std::endl;
+ return -1;
+ }
+ // 初始化数据库连接
+ if (!dbConnection->initialize()) {
+ std::cerr << "Error: Database connection initialization failed." << std::endl;
+ return -1;
+ }
+ // 业务处理：执行库存调整更新操作
+ try {
+ // 开始数据库事务
+ dbConnection->beginTransaction();
+ // 构建更新语句
+ std::string query = "UPDATE stock_adjustments SET adjustment_strategy = ?, stock_change = ?, expected_benefit = ?, 
+status = ? WHERE adjustment_id = ?";
+ if (!dbConnection->execute(query, adjustmentStrategy, stockChange, expectedBenefit, status, adjustmentId)) {
+ std::cerr << "Error: Failed to update stock adjustment record." << std::endl;
+ dbConnection->rollbackTransaction();
+ return -1;
+ }
+ // 提交事务
+ dbConnection->commitTransaction();
+ return 0; // 成功返回
+ } catch (const std::exception& e) {
+ // 记录错误日志
+ std::cerr << "Exception caught: " << e.what() << std::endl;
+ dbConnection->rollbackTransaction();
+ return -1;
+ } catch (...) {
+ // 记录未知错误日志
+ std::cerr << "Unknown error occurred during stock adjustment update." << std::endl;
+ dbConnection->rollbackTransaction();
+ return -1;
+ }
+}
+#include <sqlite3.h>
+#include <vector>
+#include <string>
+#include <stdexcept>
+#include <spdlog/spdlog.h>
+29
+实时动态库存需求预测分析平台 v1.0
+// 定义库存调整记录结构体
+struct StockAdjustment {
+ int id; // 调整记录的唯一标识符
+ std::string adjustment_date; // 调整的预测日期
+ std::string strategy_type; // 调整策略类型
+ std::string status; // 调整状态
+ // 可根据实际需求添加更多字段
+};
+/**
+ * @brief 根据条件查询库存调整记录
+ * @param date_filter 按预测日期筛选
+ * @param strategy_filter 按调整策略筛选
+ * @param status_filter 按状态筛选
+ * @param page 分页页码
+ * @param page_size 每页数据量
+ * @return 符合条件的库存调整记录列表
+ */
+std::vector<StockAdjustment> get_stockAdjustments(const std::string& date_filter, const std::string& strategy_filter, const 
+std::string& status_filter, int page, int page_size) {
+ // 参数校验：分页页码必须大于等于 1
+ if (page < 1) {
+ throw std::invalid_argument("Page number must be at least 1");
+ }
+ // 参数校验：每页数据量必须在 1 到 100 之间
+ if (page_size <= 0 || page_size > 100) {
+ throw std::invalid_argument("Page size must be between 1 and 100");
+ }
+ // 获取默认数据库连接
+ sqlite3* db;
+ int rc = sqlite3_open("stock_adjustments.db", &db);
+ if (rc != SQLITE_OK) {
+ spdlog::error("Failed to open database: {}", sqlite3_errmsg(db));
+ sqlite3_close(db);
+ throw std::runtime_error("Database connection failed");
+ }
+#include <string>
+#include <stdexcept>
+#include <chrono>
+#include <memory>
+#include <sstream>
+#include <iomanip>
+struct InventoryImportHistory {
+ std::string import_method; // 导入方式，如 CSV, JSON
+ std::string data_type; // 数据类型，如库存数据, 采购数据
+ std::string update_time; // 更新时间，ISO 8601 格式
+ std::string file_name; // 导入文件名
+ std::string file_format; // 文件格式，如 csv, json
+ std::string status; // 状态，如成功, 失败
+};
+class DatabaseManager {
+30
+实时动态库存需求预测分析平台 v1.0
+public:
+ DatabaseManager(const std::string& db_path) {
+ // 初始化数据库连接
+ int result = sqlite3_open(db_path.c_str(), &db);
+ if (result != SQLITE_OK) {
+ throw std::runtime_error("无法打开数据库: " + std::to_string(result));
+ }
+ }
+ std::vector<InventoryImportHistory> get_inventory_import_history(
+ const std::string& file_format,
+ const std::chrono::system_clock::time_point& start_date,
+ const std::chrono::system_clock::time_point& end_date,
+ int page,
+ int per_page
+ ) {
+ // 参数校验
+ if (page < 1) {
+ throw std::invalid_argument("页码不能小于 1");
+ }
+ if (per_page < 1) {
+ throw std::invalid_argument("每页记录数不能小于 1");
+ }
+ // 转换日期为字符串
+ std::string start_date_str = to_iso_string(start_date);
+ std::string end_date_str = to_iso_string(end_date);
+ // 检查日期范围是否有效
+ if (start_date > end_date) {
+ throw std::invalid_argument("开始日期不能晚于结束日期");
+ }
+ std::vector<InventoryImportHistory> history_records;
+ std::string query = "SELECT * FROM inventory_import_history "
+ "WHERE file_format = ? AND update_time BETWEEN ? AND ? "
+ "ORDER BY update_time DESC "
+ "LIMIT ? OFFSET ?";
+ sqlite3_stmt* stmt;
+ int rc = sqlite3_prepare_v2(db.get(), query.c_str(), -1, &stmt, nullptr);
+ if (rc != SQLITE_OK) {
+ throw std::runtime_error("数据库查询语句准备失败");
+ }
+ // 绑定参数
+ sqlite3_bind_text(stmt, 1, file_format.c_str(), -1, SQLITE_TRANSIENT);
+ sqlite3_bind_text(stmt, 2, start_date_str.c_str(), -1, SQLITE_TRANSIENT);
+ sqlite3_bind_text(stmt, 3, end_date_str.c_str(), -1, SQLITE_TRANSIENT);
+ sqlite3_bind_int(stmt, 4, per_page);
+ sqlite3_bind_int(stmt, 5, (page - 1) * per_page);
+ // 执行查询
+ while (sqlite3_step(stmt) == SQLITE_ROW) {
+ InventoryImportHistory record;
+ record.import_method = std::string(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1)));
+ record.data_type = std::string(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2)));
+31
+实时动态库存需求预测分析平台 v1.0
+ record.update_time = std::string(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3)));
+ record.file_name = std::string(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 4)));
+ record.file_format = std::string(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 5)));
+ record.status = std::string(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 6)));
+ history_records.push_back(record);
+ }
+ // 释放 SQL 语句资源
+ sqlite3_finalize(stmt);
+ return history_records;
+ }
+private:
+ std::string to_iso_string(const std::chrono::system_clock::time_point& tp) {
+ std::time_t t = std::chrono::system_clock::to_time_t(tp);
+ std::stringstream ss;
+ ss << std::put_time(std::localtime(&t), "%Y-%m-%d %X");
+ return ss.str();
+ }
+ std::unique_ptr<sqlite3, std::function<void(sqlite3*)>> db;
+};
+#include <sqlite3.h>
+#include <string>
+#include <stdexcept>
+#include <optional>
+#include <iostream>
+// 导入任务元数据结构
+struct ImportStatusMetadata {
+ std::string import_method; // 导入方式，如 FTP、SFTP、API 等
+ std::string data_type; // 数据类型，如销售数据、库存数据等
+ std::string start_date; // 起始日期，格式 YYYY-MM-DD
+ std::string end_date; // 结束日期，格式 YYYY-MM-DD
+ std::string file_format; // 文件格式，如 CSV、JSON、XML 等
+ std::string updated_at; // 最后更新时间，格式 ISO8601
+};
+// 数据库连接类（使用 RAII 模式）
+class DatabaseConnection {
+public:
+ DatabaseConnection(const std::string& db_path) {
+ int rc = sqlite3_open(db_path.c_str(), &db);
+ if (rc != SQLITE_OK) {
+ throw std::runtime_error("Failed to open database");
+ }
+ }
+ ~DatabaseConnection() {
+ sqlite3_close(db);
+ }
+ sqlite3* get_db() const {
+ return db;
+ }
+private:
+ sqlite3* db;
+32
+实时动态库存需求预测分析平台 v1.0
+};
+// 获取数据导入任务状态信息
+std::optional<ImportStatusMetadata> get_import_status(int task_id) {
+ if (task_id <= 0) {
+ throw std::invalid_argument("Invalid task ID");
+ }
+ try {
+ DatabaseConnection db("retail_database.db");
+ std::string sql = "SELECT import_method, data_type, start_date, end_date, file_format, updated_at FROM import_tasks 
+WHERE id = ?";
+ sqlite3_stmt* stmt;
+ if (sqlite3_prepare_v2(db.get_db(), sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
+ throw std::runtime_error("Failed to prepare SQL statement");
+ }
+ // 绑定参数
+ sqlite3_bind_int(stmt, 1, task_id);
+ // 执行查询
+ if (sqlite3_step(stmt) != SQLITE_ROW) {
+ sqlite3_finalize(stmt);
+ return std::nullopt;
+ }
+ // 构建元数据对象
+ ImportStatusMetadata metadata;
+ metadata.import_method = sqlite3_column_text(stmt, 0) ? std::string(reinterpret_cast<const 
+char*>(sqlite3_column_text(stmt, 0))) : "";
+ metadata.data_type = sqlite3_column_text(stmt, 1) ? std::string(reinterpret_cast<const 
+char*>(sqlite3_column_text(stmt, 1))) : "";
+ metadata.start_date = sqlite3_column_text(stmt, 2) ? std::string(reinterpret_cast<const 
+char*>(sqlite3_column_text(stmt, 2))) : "";
+ metadata.end_date = sqlite3_column_text(stmt, 3) ? std::string(reinterpret_cast<const char*>(sqlite3_column_text(stmt,
+3))) : "";
+ metadata.file_format = sqlite3_column_text(stmt, 4) ? std::string(reinterpret_cast<const 
+char*>(sqlite3_column_text(stmt, 4))) : "";
+ metadata.updated_at = sqlite3_column_text(stmt, 5) ? std::string(reinterpret_cast<const 
+char*>(sqlite3_column_text(stmt, 5))) : "";
+ sqlite3_finalize(stmt);
+ return metadata;
+ } catch (const std::exception& e) {
+ // 记录错误日志（此处应实际集成日志系统）
+ std::cerr << "Database error: " << e.what() << std::endl;
+ return std::nullopt;
+ }
+}
+#include <string>
+#include <regex>
+#include <SQLiteCpp/SQLiteCpp.h>
+#include <stdexcept>
+#include <memory>
+#include <iostream>
+// 数据上传结构体，包含必须字段
+33
+实时动态库存需求预测分析平台 v1.0
+struct DataUpload {
+ std::string order_id; // 订单编号，必须非空
+ int quantity; // 商品数量，必须大于零
+ std::string delivery_date; // 交货日期，必须符合 YYYY-MM-DD 格式
+ std::string warehouse_id; // 仓库编号，必须非空
+};
+// 校验结果结构体，包含状态码与错误信息
+struct ValidationResult {
+ bool success; // 校验是否通过
+ std::string error_message; // 详细错误信息
+ int http_status; // HTTP 相应状态码
+};
+// 校验上传数据完整性
+ValidationResult validate_data_integrity(const DataUpload& data) {
+ // 校验 order_id
+ if (data.order_id.empty()) {
+ std::cerr << "订单编号缺失" << std::endl;
+ return {false, "订单编号缺失", 400};
+ }
+ // 校验 quantity
+ if (data.quantity <= 0) {
+ std::cerr << "商品数量必须大于零" << std::endl;
+ return {false, "商品数量必须大于零", 400};
+ }
+ // 校验 delivery_date 格式
+ std::regex date_regex(R"(\d{4}-\d{2}-\d{2})");
+ if (!std::regex_match(data.delivery_date, date_regex)) {
+ std::cerr << "交货日期格式错误，需符合 YYYY-MM-DD" << std::endl;
+ return {false, "交货日期格式错误，需符合 YYYY-MM-DD", 400};
+ }
+ // 校验 warehouse_id
+ if (data.warehouse_id.empty()) {
+ std::cerr << "仓库编号缺失" << std::endl;
+ return {false, "仓库编号缺失", 400};
+ }
+ // 获取数据库连接
+ std::unique_ptr<SQLite::Database> db_connection;
+ try {
+ db_connection = std::make_unique<SQLite::Database>("inventory.db", SQLite::OPEN_READWRITE | 
+SQLite::OPEN_CREATE);
+ } catch (const SQLite::Exception& e) {
+ std::cerr << "数据库连接失败" << std::endl;
+ return {false, "数据库连接失败", 500};
+ }
+ // 初始化数据库结构
+ try {
+ db_connection->exec("CREATE TABLE IF NOT EXISTS inventory_logs ("
+ "order_id TEXT NOT NULL,"
+ "quantity INTEGER NOT NULL,"
+ "delivery_date TEXT NOT NULL,"
+34
+实时动态库存需求预测分析平台 v1.0
+ "warehouse_id TEXT NOT NULL,"
+ "PRIMARY KEY(order_id, warehouse_id))");
+ } catch (const SQLite::Exception& e) {
+ std::cerr << "数据库初始化失败" << std::endl;
+ return {false, "数据库初始化失败", 500};
+ }
+ // 执行数据持久化
+ try {
+ SQLite::Statement stmt(*db_connection, "INSERT INTO inventory_logs (order_id, quantity, delivery_date, warehouse_id) 
+VALUES (?, ?, ?, ?)");
+ stmt.bind(1, data.order_id);
+ stmt.bind(2, data.quantity);
+ stmt.bind(3, data.delivery_date);
+ stmt.bind(4, data.warehouse_id);
+ stmt.execAndClear();
+ return {true, "", 200};
+ } catch (const SQLite::Exception& e) {
+ std::cerr << "数据库写入失败: " << e.what() << std::endl;
+ return {false, "数据库写入失败", 500};
+ }
+}
+#include <iostream>
+#include <stdexcept>
+#include <string>
+#include <sqlite3.h> // 假设使用 SQLite 作为数据库
+// 删除指定 ID 的数据导入记录，包括关联的元数据和校验结果
+void delete_import_record(int record_id) {
+ try {
+ // 参数校验：检查 record_id 是否为有效 ID
+ if (record_id <= 0) {
+ throw std::invalid_argument("Record ID must be a positive integer");
+ }
+ // 获取默认数据库连接
+ sqlite3* db;
+ int rc = sqlite3_open("database.db", &db);
+ if (rc != SQLITE_OK) {
+ throw std::runtime_error("Failed to open database");
+ }
+ // 开始事务以确保原子性
+ sqlite3_begin_transaction(db);
+ // 删除校验结果记录
+ std::string delete_validation_sql = "DELETE FROM validation_results WHERE import_record_id = ?";
+ sqlite3_stmt* stmt_validation;
+ rc = sqlite3_prepare_v2(db, delete_validation_sql.c_str(), -1, &stmt_validation, nullptr);
+ if (rc != SQLITE_OK) {
+ sqlite3_finalize(stmt_validation);
+ sqlite3_end_transaction(db);
+ sqlite3_close(db);
+ throw std::runtime_error("Failed to prepare statement for validation results");
+ }
+35
+实时动态库存需求预测分析平台 v1.0
+ // 绑定参数
+ rc = sqlite3_bind_int(stmt_validation, 1, record_id);
+ if (rc != SQLITE_OK) {
+ sqlite3_finalize(stmt_validation);
+ sqlite3_end_transaction(db);
+ sqlite3_close(db);
+ throw std::runtime_error("Failed to bind record ID to validation results statement");
+ }
+ // 执行删除操作
+ rc = sqlite3_step(stmt_validation);
+ if (rc != SQLITE_DONE) {
+ sqlite3_finalize(stmt_validation);
+ sqlite3_end_transaction(db);
+ sqlite3_close(db);
+ throw std::runtime_error("Failed to delete validation results for record ID");
+ }
+ // 清理语句
+ sqlite3_finalize(stmt_validation);
+ // 删除元数据记录
+ std::string delete_metadata_sql = "DELETE FROM metadata WHERE import_record_id = ?";
+ sqlite3_stmt* stmt_metadata;
+ rc = sqlite3_prepare_v2(db, delete_metadata_sql.c_str(), -1, &stmt_metadata, nullptr);
+ if (rc != SQLITE_OK) {
+ sqlite3_end_transaction(db);
+ sqlite3_close(db);
+ throw std::runtime_error("Failed to prepare statement for metadata");
+ }
+ // 绑定参数
+ rc = sqlite3_bind_int(stmt_metadata, 1, record_id);
+ if (rc != SQLITE_OK) {
+ sqlite3_finalize(stmt_metadata);
+ sqlite3_end_transaction(db);
+ sqlite3_close(db);
+ throw std::runtime_error("Failed to bind record ID to metadata statement");
+ }
+ // 执行删除操作
+ rc = sqlite3_step(stmt_metadata);
+ if (rc != SQLITE_DONE) {
+ sqlite3_finalize(stmt_metadata);
+ sqlite3_end_transaction(db);
+ sqlite3_close(db);
+ throw std::runtime_error("Failed to delete metadata for record ID");
+ }
+ // 清理语句
+ sqlite3_finalize(stmt_metadata);
+ // 删除主数据导入记录
+ std::string delete_record_sql = "DELETE FROM import_records WHERE id = ?";
+ sqlite3_stmt* stmt_record;
+ rc = sqlite3_prepare_v2(db, delete_record_sql.c_str(), -1, &stmt_record, nullptr);
+ if (rc != SQLITE_OK) {
+36
+实时动态库存需求预测分析平台 v1.0
+ sqlite3_end_transaction(db);
+ sqlite3_close(db);
+ throw std::runtime_error("Failed to prepare statement for import record");
+ }
+ // 绑定参数
+ rc = sqlite3_bind_int(stmt_record, 1, record_id);
+ if (rc != SQLITE_OK) {
+ sqlite3_finalize(stmt_record);
+ sqlite3_end_transaction(db);
+ sqlite3_close(db);
+ throw std::runtime_error("Failed to bind record ID to import record statement");
+ }
+ // 执行删除操作
+ rc = sqlite3_step(stmt_record);
+ if (rc != SQLITE_DONE) {
+ sqlite3_finalize(stmt_record);
+ sqlite3_end_transaction(db);
+ sqlite3_close(db);
+ throw std::runtime_error("Failed to delete import record for record ID");
+ }
+ // 清理语句
+ sqlite3_finalize(stmt_record);
+ // 提交事务
+ sqlite3_commit_transaction(db);
+ sqlite3_close(db);
+ } catch (const std::exception& e) {
+ // 记录错误日志（生产环境应替换为实际日志系统）
+ std::cerr << "Error in delete_import_record: " << e.what() << std::endl;
+ throw;
+ } catch (...) {
+ // 记录未知错误
+ std::cerr << "Unknown error occurred in delete_import_record" << std::endl;
+ throw;
+ }
+}
+#include <fstream>
+#include <sstream>
+#include <vector>
+#include <string>
+#include <stdexcept>
+#include <filesystem>
+#include <sqlite3.h>
+#include <nlohmann/json.hpp>
+// 定义库存数据结构体
+struct InventoryData {
+ int product_id; // 商品唯一标识符
+ int quantity; // 库存数量
+ std::string date; // 日期信息
+};
+// 定义导入日志结构体
+37
+实时动态库存需求预测分析平台 v1.0
+struct InventoryImportLog {
+ std::string file_path; // 文件完整路径
+ std::string format; // 文件格式类型
+ std::string start_date; // 导入起始日期范围
+ std::string end_date; // 导入结束日期范围
+ int record_count; // 处理数据条数
+ std::string error_message; // 错误信息记录
+};
+// 将字符串转换为 tm 结构体，用于日期比较
+std::optional<tm> convert_string_to_date(const std::string& date_str) {
+ struct tm tm_time = {};
+ std::istringstream iss(date_str);
+ iss >> std::get_time(&tm_time, "%Y-%m-%d");
+ if (iss.fail()) {
+ return std::nullopt;
+ }
+ std::time_t time = std::mktime(&tm_time);
+ if (time == -1) {
+ return std::nullopt;
+ }
+ return tm_time;
+}
+// 解析 CSV 文件
+std::vector<InventoryData> parse_csv(const std::string& file_path) {
+ std::vector<InventoryData> data;
+ std::ifstream file(file_path);
+ if (!file.is_open()) {
+ throw std::runtime_error("CSV 文件未找到或无法打开");
+ }
+ std::string line;
+ while (std::getline(file, line)) {
+ std::istringstream iss(line);
+ std::string product_id_str, quantity_str, date_str;
+ if (std::getline(iss, product_id_str, ',') && 
+ std::getline(iss, quantity_str, ',') && 
+ std::getline(iss, date_str, ',')) {
+ try {
+ int product_id = std::stoi(product_id_str);
+ int quantity = std::stoi(quantity_str);
+ data.emplace_back(InventoryData{product_id, quantity, date_str});
+ } catch (const std::invalid_argument& e) {
+ throw std::runtime_error("CSV 文件数据格式不正确");
+ } catch (const std::out_of_range& e) {
+ throw std::runtime_error("CSV 文件数据超出整型范围");
+ }
+ }
+ }
+ if (data.empty()) {
+ throw std::runtime_error("CSV 文件中未找到有效数据");
+ }
+38
+实时动态库存需求预测分析平台 v1.0
+ return data;
+}
+// 解析 JSON 文件
+std::vector<InventoryData> parse_json(const std::string& file_path) {
+ std::ifstream file(file_path);
+ if (!file.is_open()) {
+ throw std::runtime_error("JSON 文件未找到或无法打开");
+ }
+ std::string json_str((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+ json j;
+ try {
+ j = json::parse(json_str);
+ } catch (const json::parse_error& e) {
+ throw std::runtime_error("JSON 文件解析错误");
+ }
+ std::vector<InventoryData> data;
+ for (const auto& item : j) {
+ try {
+ int product_id = item["product_id"].get<int>();
+ int quantity = item["quantity"].get<int>();
+ std::string date = item["date"].get<std::string>();
+ data.emplace_back(InventoryData{product_id, quantity, date});
+ } catch (const json::exception& e) {
+ throw std::runtime_error("JSON 数据结构不匹配");
+ }
+ }
+ if (data.empty()) {
+ throw std::runtime_error("JSON 文件中未找到有效数据");
+ }
+ return data;
+}
+// 解析 Excel 文件（假定使用第三方库，此处暂不实现）
+std::vector<InventoryData> parse_excel(const std::string& file_path) {
+ throw std::runtime_error("Excel 文件解析功能尚未实现");
+}
+// 导入库存数据
+std::pair<int, std::string> import_inventory_data(const std::string& file_path, const std::string& format, const std::string& 
+start_date, const std::string& end_date) {
+ try {
+ // 检查文件是否存在
+ if (!std::filesystem::exists(file_path)) {
+ throw std::runtime_error("导入文件不存在");
+ }
+ // 检查格式是否有效
+ if (format != "csv" && format != "json" && format != "excel") {
+ throw std::invalid_argument("不支持的文件格式");
+ }
+ // 日期解析和校验
+ auto start_tm = convert_string_to_date(start_date);
+ auto end_tm = convert_string_to_date(end_date);
+39
+实时动态库存需求预测分析平台 v1.0
+ if (!start_tm || !end_tm) {
+ throw std::invalid_argument("日期格式不正确");
+ }
+ if (std::mktime(&start_tm->tm_time) > std::mktime(&end_tm->tm_time)) {
+ throw std::invalid_argument("起始日期在结束日期之后");
+ }
+ // 解析文件内容
+ std::vector<InventoryData> inventory_data;
+ if (format == "csv") {
+ inventory_data = parse_csv(file_path);
+ } else if (format == "json") {
+ inventory_data = parse_json(file_path);
+ } else {
+ inventory_data = parse_excel(file_path);
+ }
+ // 数据校验
+ for (const auto& item : inventory_data) {
+ auto date_tm = convert_string_to_date(item.date);
+ if (!date_tm) {
+ throw std::invalid_argument("日期字段格式不正确");
+ }
+ if (std::mktime(&date_tm->tm_time) < std::mktime(&start_tm->tm_time) || 
+ std::mktime(&date_tm->tm_time) > std::mktime(&end_tm->tm_time)) {
+ throw std::invalid_argument("库存数据日期超出指定范围");
+ }
+ if (item.quantity < 0) {
+ throw std::invalid_argument("库存数量不能为负数");
+ }
+ }
+ // 数据库连接和事务处理
+ sqlite3* db;
+ int rc = sqlite3_open("inventory.db", &db);
+ if (rc != SQLITE_OK) {
+ throw std::runtime_error("数据库连接失败");
+ }
+ // 开始事务
+ if (sqlite3_exec(db, "BEGIN TRANSACTION", nullptr, nullptr, nullptr) != SQLITE_OK) {
+ throw std::runtime_error("数据库事务启动失败");
+ }
+ // 插入库存数据
+ std::string insert_sql = "INSERT INTO inventory (product_id, quantity, date) VALUES (?, ?, ?)";
+ sqlite3_stmt* stmt;
+ if (sqlite3_prepare_v2(db, insert_sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
+ throw std::runtime_error("库存数据插入语句预编译失败");
+ }
+ for (const auto& item : inventory_data) {
+ sqlite3_bind_int(stmt, 1, item.product_id);
+ sqlite3_bind_int(stmt, 2, item.quantity);
+ sqlite3_bind_text(stmt, 3, item.date.c_str(), -1, SQLITE_TRANSIENT);
+ if (sqlite3_step(stmt) != SQLITE_DONE) {
+40
+实时动态库存需求预测分析平台 v1.0
+ throw std::runtime_error("库存数据插入失败");
+ }
+ sqlite3_reset(stmt);
+ }
+ sqlite3_finalize(stmt);
+ // 记录导入日志
+ std::string insert_log_sql = "INSERT INTO inventory_import_log (file_path, format, start_date, end_date, record_count, 
+error_message) VALUES (?, ?, ?, ?, ?, ?)";
+ sqlite3_stmt* log_stmt;
+ if (sqlite3_prepare_v2(db, insert_log_sql.c_str(), -1, &log_stmt, nullptr) != SQLITE_OK) {
+ throw std::runtime_error("导入日志插入语句预编译失败");
+ }
+ sqlite3_bind_text(log_stmt, 1, file_path.c_str(), -1, SQLITE_TRANSIENT);
+ sqlite3_bind_text(log_stmt, 2, format.c_str(), -1, SQLITE_TRANSIENT);
+ sqlite3_bind_text(log_stmt, 3, start_date.c_str(), -1, SQLITE_TRANSIENT);
+ sqlite3_bind_text(log_stmt, 4, end_date.c_str(), -1, SQLITE_TRANSIENT);
+ sqlite3_bind_int(log_stmt, 5, static_cast<int>(inventory_data.size()));
+ sqlite3_bind_text(log_stmt, 6, "", -1, SQLITE_TRANSIENT);
+ if (sqlite3_step(log_stmt) != SQLITE_DONE) {
+ throw std::runtime_error("导入日志记录失败");
+ }
+ sqlite3_reset(log_stmt);
+ sqlite3_finalize(log_stmt);
+ // 提交事务
+ if (sqlite3_exec(db, "COMMIT TRANSACTION", nullptr, nullptr, nullptr) != SQLITE_OK) {
+ throw std::runtime_error("数据库事务提交失败");
+ }
+ sqlite3_close(db);
+ return {200, "库存数据导入成功"};
+ } catch (const std::exception& e) {
+ std::cerr << "导入过程中发生错误: " << e.what() << std::endl;
+ // 记录导入错误日志
+ sqlite3* db;
+ int rc = sqlite3_open("inventory.db", &db);
+ if (rc == SQLITE_OK) {
+ std::string error_message = "导入错误: " + std::string(e.what());
+ std::string insert_log_sql = "INSERT INTO inventory_import_log (file_path, format, start_date, end_date, record_count, 
+error_message) VALUES (?, ?, ?, ?, ?, ?)";
+ sqlite3_stmt* log_stmt;
+ if (sqlite3_prepare_v2(db, insert_log_sql.c_str(), -1, &log_stmt, nullptr) != SQLITE_OK) {
+ std::cerr << "数据库操作失败: 日志语句预编译错误" << std::endl;
+ } else {
+ sqlite3_bind_text(log_stmt, 1, file_path.c_str(), -1, SQLITE_TRANSIENT);
+ sqlite3_bind_text(log_stmt, 2, format.c_str(), -1, SQLITE_TRANSIENT);
+ sqlite3_bind_text(log_stmt, 3, start_date.c_str(), -1, SQLITE_TRANSIENT);
+ sqlite3_bind_text(log_stmt, 4, end_date.c_str(), -1, SQLITE_TRANSIENT);
+ sqlite3_bind_int(log_stmt, 5, 0); 
+ sqlite3_bind_text(log_stmt, 6, error_message.c_str(), -1, SQLITE_TRANSIENT);
+ if (sqlite3_step(log_stmt) != SQLITE_DONE) {
+ std::cerr << "数据库操作失败: 日志插入错误" << std::endl;
+41
+实时动态库存需求预测分析平台 v1.0
+ }
+ sqlite3_reset(log_stmt);
+ sqlite3_finalize(log_stmt);
+ }
+ sqlite3_close(db);
+ }
+ return {500, "导入系统内部错误"};
+ } catch (...) {
+ std::cerr << "未知错误导致导入失败" << std::endl;
+ return {500, "导入系统内部错误"};
+ }
+}
+#include <sqlite3.h>
+#include <map>
+#include <string>
+#include <stdexcept>
+#include <iostream>
+// 删除指定预测模型记录
+std::map<std::string, std::string> deletePredictionModel(const std::string& modelId) {
+ // 检查模型 ID 是否为空，若为空则记录错误并返回空字典
+ if (modelId.empty()) {
+ std::cerr << "模型 ID 为空，无法删除" << std::endl;
+ return {};
+ }
+ // 获取默认数据库连接
+ sqlite3* db;
+ int rc = sqlite3_open("prediction_models.db", &db);
+ if (rc != SQLITE_OK) {
+ std::cerr << "无法打开数据库: " << sqlite3_errstr(rc) << std::endl;
+ return {};
+ }
+ // 构造删除 SQL 语句
+ std::string sql = "DELETE FROM prediction_models WHERE id = ?";
+ sqlite3_stmt* stmt;
+ rc = sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
+ if (rc != SQLITE_OK) {
+ std::cerr << "准备 SQL 语句失败: " << sqlite3_errstr(rc) << std::endl;
+ sqlite3_close(db);
+ return {};
+ }
+ // 绑定模型 ID 参数
+ rc = sqlite3_bind_text(stmt, 1, modelId.c_str(), modelId.size(), SQLITE_STATIC);
+ if (rc != SQLITE_OK) {
+ std::cerr << "参数绑定失败: " << sqlite3_errstr(rc) << std::endl;
+ sqlite3_finalize(stmt);
+ sqlite3_close(db);
+ return {};
+ }
+ // 执行删除操作
+ rc = sqlite3_step(stmt);
+42
+实时动态库存需求预测分析平台 v1.0
+ if (rc != SQLITE_DONE) {
+ std::cerr << "删除操作失败: " << sqlite3_errstr(rc) << std::endl;
+ sqlite3_finalize(stmt);
+ sqlite3_close(db);
+ return {};
+ }
+ // 关闭 SQL 语句和数据库连接
+ sqlite3_finalize(stmt);
+ sqlite3_close(db);
+ // 返回成功状态和模型 ID
+ std::map<std::string, std::string> result;
+ result["status"] = "success";
+ result["model_id"] = modelId;
+ return result;
+}
+#include <iostream>
+#include <string>
+#include <map>
+#include <stdexcept>
+#include <pqxx/pqxx>
+namespace retail {
+ // PredictionModel class encapsulates the metadata structure of a forecasting model
+ class PredictionModel {
+ public:
+ std::string id; // Unique identifier for the model
+ std::string name; // Model name
+ std::string description; // Detailed description of the model
+ std::string training_data; // Data used for training the model
+ std::string algorithm_type; // Type of algorithm used for prediction
+ };
+ // Retrieves detailed information of a prediction model by its ID
+ std::map<std::string, std::string> getPredictionModelById(const std::string& model_id) {
+ // Validate input parameters
+ if (model_id.empty()) {
+ throw std::invalid_argument("Model ID is empty");
+ }
+ // Establish database connection
+ try {
+ pqxx::connection conn("dbname=retail_db user=postgres password=secret host=localhost");
+ if (!conn.is_open()) {
+ throw std::runtime_error("Failed to connect to database");
+ }
+ // Execute database query
+ pqxx::work txn(conn);
+ std::string query = "SELECT * FROM prediction_models WHERE id = $1";
+ pqxx::result res = txn.exec(query, model_id);
+ // Check if query results are empty
+ if (res.empty()) {
+ return {};
+ }
+43
+实时动态库存需求预测分析平台 v1.0
+ // Map query results to prediction model data
+ std::map<std::string, std::string> model_data;
+ for (const auto& row : res) {
+ model_data["id"] = row["id"].c_str();
+ model_data["name"] = row["name"].c_str();
+ model_data["description"] = row["description"].c_str();
+ model_data["training_data"] = row["training_data"].c_str();
+ model_data["algorithm_type"] = row["algorithm_type"].c_str();
+ break; // Assume single record per id
+ }
+ return model_data;
+ } catch (const std::exception& e) {
+ // Log database errors
+ std::cerr << "Database error: " << e.what() << std::endl;
+ return {};
+ } catch (...) {
+ // Log unexpected errors
+ std::cerr << "Unexpected error occurred" << std::endl;
+ return {};
+ }
+ }
+}
+#include <string>
+#include <map>
+#include <stdexcept>
+#include <boost/uuid/uuid.hpp>
+#include <boost/uuid/uuid_generators.hpp>
+#include <boost/uuid/uuid_io.hpp>
+#include <nlohmann/json.hpp>
+#include <sqlite3.h>
+class ModelError : public std::runtime_error {
+public:
+ ModelError(int code, const std::string& message) : std::runtime_error(message), code_(code) {}
+ int code() const { return code_; }
+private:
+ int code_;
+};
+// 将参数调整配置转换为 JSON 字符串
+std::string parameterAdjustmentsToJson(const std::map<std::string, std::string>& config) {
+ nlohmann::json jsonConfig = config;
+ return jsonConfig.dump();
+}
+// 记录错误日志（生产环境应使用实际日志系统，此为模拟实现）
+void logError(const std::string& message) {
+ std::cerr << "[错误] " << message << std::endl;
+}
+std::map<std::string, std::string> createPredictionModel(
+ const std::string& modelName,
+ const std::string& modelType,
+ int predictionCycle,
+44
+实时动态库存需求预测分析平台 v1.0
+ double predictionAccuracy,
+ const std::string& dataSource,
+ const std::map<std::string, std::string>& parameterAdjustments
+) {
+ // 参数校验
+ if (modelName.empty()) {
+ throw ModelError(400, "模型名称不能为空");
+ }
+ if (modelType.empty()) {
+ throw ModelError(400, "模型类型不能为空");
+ }
+ if (predictionCycle <= 0) {
+ throw ModelError(400, "预测周期必须大于零");
+ }
+ if (predictionAccuracy < 0 || predictionAccuracy > 1) {
+ throw ModelError(400, "预测精度必须在 0 到 1 之间");
+ }
+ if (dataSource.empty()) {
+ throw ModelError(400, "数据来源不能为空");
+ }
+ if (parameterAdjustments.empty()) {
+ throw ModelError(400, "参数调整配置不能为空");
+ }
+ // 验证模型类型是否合法
+ std::set<std::string> validTypes = {"ARIMA", "LSTM", "Prophet"};
+ if (validTypes.find(modelType) == validTypes.end()) {
+ throw ModelError(400, "无效的模型类型");
+ }
+ // 生成模型 ID
+ boost::uuids::random_generator gen;
+ std::string modelId = boost::uuids::to_string(gen());
+ // 初始化数据库连接（使用默认 SQLite 配置）
+ SQLite::Database db("prediction.db", SQLite::OPEN_READWRITE | SQLite::OPEN_CREATE);
+ try {
+ // 插入预测模型记录
+ db.exec("INSERT INTO prediction_models (model_id, model_name, model_type, prediction_cycle, prediction_accuracy, 
+data_source, parameter_adjustments) VALUES (?, ?, ?, ?, ?, ?, ?)",
+ modelId, modelName, modelType, predictionCycle, predictionAccuracy, dataSource, 
+parameterAdjustmentsToJson(parameterAdjustments));
+ } catch (const SQLite::SQLException& e) {
+ logError("数据库操作失败: " + std::string(e.what()));
+ throw ModelError(500, "数据库操作失败");
+ } catch (const std::exception& e) {
+ logError("通用异常: " + std::string(e.what()));
+ throw ModelError(500, "内部服务器错误");
+ }
+ // 构建返回结果
+ std::map<std::string, std::string> result;
+ result["model_id"] = modelId;
+ result["model_name"] = modelName;
+45
+实时动态库存需求预测分析平台 v1.0
+ result["model_type"] = modelType;
+ result["prediction_cycle"] = std::to_string(predictionCycle);
+ result["prediction_accuracy"] = std::to_string(predictionAccuracy);
+ result["data_source"] = dataSource;
+ result["parameter_adjustments"] = parameterAdjustmentsToJson(parameterAdjustments);
+ return result;
+}
+#include <sqlite3.h>
+#include <map>
+#include <vector>
+#include <string>
+#include <stdexcept>
+#include <iostream>
+// 自定义异常类用于处理预测过程中的错误
+class PredictionException : public std::runtime_error {
+public:
+ int http_status_code;
+ PredictionException(const std::string& message, int code) : std::runtime_error(message), http_status_code(code) {}
+};
+// 根据历史数据计算简单平均值作为预测值（示例算法）
+double calculateAverageDemand(const std::vector<std::pair<std::string, int>>& data) {
+ if (data.empty()) {
+ throw PredictionException("Input dataset is empty", 400);
+ }
+ double total = 0;
+ for (const auto& item : data) {
+ total += static_cast<double>(item.second);
+ }
+ return total / data.size();
+}
+// 根据配置的预测模型对库存需求进行预测
+std::map<std::string, double> predictInventoryDemand(const std::string& modelId, const std::vector<std::pair<std::string, 
+int>>& inputDataset) {
+ try {
+ // 参数校验
+ if (modelId.empty()) {
+ throw PredictionException("Model ID cannot be empty", 400);
+ }
+ if (inputDataset.empty()) {
+ throw PredictionException("Input dataset is empty", 400);
+ }
+ // 获取默认数据库连接
+ sqlite3* db;
+ int rc = sqlite3_open("inventory.db", &db);
+ if (rc != SQLITE_OK) {
+ throw PredictionException("Failed to connect to database", 500);
+ }
+ // 查询模型配置
+ std::string query = "SELECT algorithm_type FROM models WHERE model_id = ?";
+ rc = sqlite3_prepare_v2(db, query.c_str(), -1, &stmt, nullptr);
+46
+实时动态库存需求预测分析平台 v1.0
+ if (rc != SQLITE_OK) {
+ sqlite3_close(db);
+ throw PredictionException("Database query failed", 500);
+ }
+ sqlite3_bind_text(stmt, 1, modelId.c_str(), modelId.size(), SQLITE_TRANSIENT);
+ // 执行查询
+ rc = sqlite3_step(stmt);
+ if (rc != SQLITE_ROW) {
+ sqlite3_finalize(stmt);
+ sqlite3_close(db);
+ throw PredictionException("Model not found", 404);
+ }
+ // 获取模型类型
+ std::string algorithmType(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0)));
+ sqlite3_finalize(stmt);
+ // 调用预测算法（示例实现）
+ double predictedValue = calculateAverageDemand(inputDataset);
+ double confidenceLower = predictedValue * 0.95;
+ double confidenceUpper = predictedValue * 1.05;
+ // 持久化预测结果
+ std::string insertQuery = "INSERT INTO inventory_predictions (model_id, predicted_value, confidence_lower, 
+confidence_upper) VALUES (?, ?, ?, ?)";
+ rc = sqlite3_prepare_v2(db, insertQuery.c_str(), -1, &stmt, nullptr);
+ if (rc != SQLITE_OK) {
+ sqlite3_close(db);
+ throw PredictionException("Failed to prepare insert statement", 500);
+ }
+ sqlite3_bind_text(stmt, 1, modelId.c_str(), modelId.size(), SQLITE_TRANSIENT);
+ sqlite3_bind_double(stmt, 2, predictedValue);
+ sqlite3_bind_double(stmt, 3, confidenceLower);
+ sqlite3_bind_double(stmt, 4, confidenceUpper);
+ rc = sqlite3_step(stmt);
+ if (rc != SQLITE_DONE) {
+ sqlite3_close(db);
+ throw PredictionException("Failed to persist prediction results", 500);
+ }
+ sqlite3_close(db);
+ // 构造预测结果
+ std::map<std::string, double> result;
+ result["predicted_demand"] = predictedValue;
+ result["confidence_lower"] = confidenceLower;
+ result["confidence_upper"] = confidenceUpper;
+ return result;
+ } catch (const PredictionException& e) {
+ // 记录错误日志
+ std::cerr << "Prediction failed: " << e.what() << std::endl;
+ return {};
+ } catch (const std::exception& e) {
+ // 记录错误日志
+ std::cerr << "Unexpected error: " << e.what() << std::endl;
+47
+实时动态库存需求预测分析平台 v1.0
+ return {};
+ } catch (...) {
+ // 记录错误日志
+ std::cerr << "Unknown error occurred during prediction" << std::endl;
+ return {};
+ }
+}
+#include <vector>
+#include <string>
+#include <stdexcept>
+#include <sqlite3.h>
+#include <spdlog/spdlog.h> // 生产环境需替换为实际日志系统
+// 定义预测模型基础信息结构体
+struct ModelInfo {
+ std::string id; // 预测模型 ID
+ std::string metadata; // 模型基础元数据
+};
+// 获取所有预测模型列表，支持多维度过滤
+std::vector<ModelInfo> listPredictionModels(const std::string& modelType, int predictionInterval, double accuracy) {
+ // 参数校验
+ if (predictionInterval < 0) {
+ spdlog::error("预测周期不能为负数");
+ throw std::invalid_argument("Invalid prediction interval value");
+ }
+ if (accuracy < 0.0 || accuracy > 1.0) {
+ spdlog::error("精度范围应在 0.0 到 1.0 之间");
+ throw std::invalid_argument("Invalid accuracy range");
+ }
+ std::vector<ModelInfo> models;
+ sqlite3* db = nullptr;
+ std::string sqlQuery;
+ try {
+ // 初始化数据库连接（生产环境需替换为实际数据库配置）
+ int result = sqlite3_open("prediction_models.db", &db);
+ if (result != SQLITE_OK) {
+ spdlog::error("无法连接数据库: {}", sqlite3_errmsg(db));
+ throw std::runtime_error("Database connection failed");
+ }
+ // 构造 SQL 查询语句
+ sqlQuery = "SELECT id, metadata FROM prediction_models WHERE 1=1";
+ if (!modelType.empty()) {
+ sqlQuery += " AND type = ?";
+ }
+ if (predictionInterval > 0) {
+ sqlQuery += " AND interval = ?";
+ }
+ if (accuracy >= 0.0 && accuracy <= 1.0) {
+ sqlQuery += " AND accuracy BETWEEN ? AND ?";
+ }
+ sqlite3_stmt* stmt = nullptr;
+48
+实时动态库存需求预测分析平台 v1.0
+ // 执行查询（备用方案：使用预编译语句）
+ result = sqlite3_prepare_v2(db, sqlQuery.c_str(), -1, &stmt, nullptr);
+ if (result != SQLITE_OK) {
+ spdlog::error("SQL 查询编译失败: {}", sqlite3_errmsg(db));
+ sqlite3_close(db);
+ throw std::runtime_error("SQL compilation error");
+ }
+ // 绑定查询参数
+ int paramIndex = 1;
+ if (!modelType.empty()) {
+ sqlite3_bind_text(stmt, paramIndex++, modelType.c_str(), -1, SQLITE_STATIC);
+ }
+ if (predictionInterval > 0) {
+ sqlite3_bind_int(stmt, paramIndex++, predictionInterval);
+ }
+ if (accuracy >= 0.0 && accuracy <= 1.0) {
+ sqlite3_bind_double(stmt, paramIndex++, accuracy);
+ sqlite3_bind_double(stmt, paramIndex++, accuracy);
+ }
+ // 获取查询结果
+ while (sqlite3_step(stmt) == SQLITE_ROW) {
+ ModelInfo model;
+ model.id = std::string(reinterpret_cast<char*>(sqlite3_column_text(stmt, 0)));
+ model.metadata = std::string(reinterpret_cast<char*>(sqlite3_column_text(stmt, 1)));
+ models.push_back(model);
+ }
+ // 清理资源
+ sqlite3_finalize(stmt);
+ sqlite3_close(db);
+ } catch (const std::exception& e) {
+ spdlog::error("数据库操作失败: {}", e.what());
+ sqlite3_close(db); // 确保数据库连接释放
+ return models; // 返回空列表
+ }
+ // 检查查询结果
+ if (models.empty()) {
+ spdlog::info("未找到匹配的预测模型");
+ }
+ return models;
+}
+#include <sqlite3.h>
+#include <map>
+#include <string>
+#include <stdexcept>
+#include <iostream>
+#include <sstream>
+#include <cstdlib>
+std::map<std::string, std::string> updatePredictionModel(const std::string& model_id, const std::map<std::string, 
+std::string>& updateFields) {
+ // 获取数据库连接
+49
+实时动态库存需求预测分析平台 v1.0
+ sqlite3* db;
+ int rc = sqlite3_open("models.db", &db);
+ if (rc != SQLITE_OK) {
+ std::cerr << "数据库连接失败: " << sqlite3_errmsg(db) << std::endl;
+ sqlite3_close(db);
+ return {};
+ }
+ // 参数校验：模型 ID 不能为空
+ if (model_id.empty()) {
+ std::cerr << "模型 ID 不能为空" << std::endl;
+ sqlite3_close(db);
+ return {};
+ }
+ // 验证需要更新的字段是否合法且值类型正确
+ std::map<std::string, std::string> validFields;
+ for (const auto& field : updateFields) {
+ if (field.first == "name" || field.first == "type" || field.first == "cycle" || field.first == "accuracy" || field.first == 
+"data_source") {
+ validFields[field.first] = field.second;
+ }
+ }
+ // 如果没有需要更新的字段直接返回空
+ if (validFields.empty()) {
+ std::cerr << "没有需要更新的字段" << std::endl;
+ sqlite3_close(db);
+ return {};
+ }
+ // 查询是否存在该模型
+ std::string query = "SELECT name, type, cycle, accuracy, data_source FROM prediction_models WHERE id = ?";
+ sqlite3_stmt* stmt;
+ rc = sqlite3_prepare_v2(db, query.c_str(), -1, &stmt, NULL);
+ if (rc != SQLITE_OK) {
+ std::cerr << "预处理查询失败: " << sqlite3_errmsg(db) << std::endl;
+ sqlite3_close(db);
+ return {};
+ }
+ rc = sqlite3_bind_text(stmt, 1, model_id.c_str(), model_id.length(), SQLITE_STATIC);
+ if (rc != SQLITE_OK) {
+ std::cerr << "绑定参数失败: " << sqlite3_errmsg(db) << std::endl;
+ sqlite3_finalize(stmt);
+ sqlite3_close(db);
+ return {};
+ }
+ // 检查是否存在模型
+ if (sqlite3_step(stmt) != SQLITE_ROW) {
+ std::cerr << "未找到模型: " << model_id << std::endl;
+ sqlite3_finalize(stmt);
+ sqlite3_close(db);
+ return {};
+ }
+50
+实时动态库存需求预测分析平台 v1.0
+ // 构建更新后的元数据
+ std::map<std::string, std::string> updated;
+ updated["id"] = model_id;
+ updated["name"] = std::string(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0)));
+ updated["type"] = std::string(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1)));
+ updated["cycle"] = std::string(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2)));
+ updated["accuracy"] = std::string(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3)));
+ updated["data_source"] = std::string(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 4)));
+ // 设置更新字段值
+ for (const auto& field : validFields) {
+ if (field.first == "cycle") {
+ try {
+ // 检查 cycle 字段是否为整数
+ std::stringstream ss(field.second);
+ int value;
+ ss >> value;
+ if (ss.fail()) {
+ std::cerr << "cycle 字段值不合法" << std::endl;
+ sqlite3_finalize(stmt);
+ sqlite3_close(db);
+ return {};
+ }
+ // 转换为字符串再存入
+ updated["cycle"] = std::to_string(value);
+ } catch (const std::invalid_argument&) {
+ std::cerr << "cycle 字段值不合法" << std::endl;
+ sqlite3_finalize(stmt);
+ sqlite3_close(db);
+ return {};
+ }
+ } else if (field.first == "accuracy") {
+ try {
+ // 检查 accuracy 字段是否为浮点数
+ std::stringstream ss(field.second);
+ float value;
+ ss >> value;
+ if (ss.fail()) {
+ std::cerr << "accuracy 字段值不合法" << std::endl;
+ sqlite3_finalize(stmt);
+ sqlite3_close(db);
+ return {};
+ }
+ // 转换为字符串再存入
+ updated["accuracy"] = std::to_string(value);
+ } catch (const std::invalid_argument&) {
+ std::cerr << "accuracy 字段值不合法" << std::endl;
+ sqlite3_finalize(stmt);
+ sqlite3_close(db);
+ return {};
+ }
+51
+实时动态库存需求预测分析平台 v1.0
+ } else {
+ updated[field.first] = field.second;
+ }
+ }
+ // 构建更新语句
+ std::string updateQuery = "UPDATE prediction_models SET ";
+ std::string cols;
+ for (const auto& field : validFields) {
+ cols += field.first + " = ?, ";
+ }
+ cols = cols.substr(0, cols.length() - 2);
+ updateQuery += cols + " WHERE id = ?";
+ sqlite3_stmt* updateStmt;
+ rc = sqlite3_prepare_v2(db, updateQuery.c_str(), -1, &updateStmt, NULL);
+ if (rc != SQLITE_OK) {
+ std::cerr << "更新语句预处理失败: " << sqlite3_errmsg(db) << std::endl;
+ sqlite3_finalize(stmt);
+ sqlite3_close(db);
+ return {};
+ }
+ // 绑定参数
+ int bindIndex = 1;
+ for (const auto& field : validFields) {
+ const char* value = field.second.c_str();
+ rc = sqlite3_bind_text(updateStmt, bindIndex, value, -1, SQLITE_STATIC);
+ if (rc != SQLITE_OK) {
+ std::cerr << "绑定参数失败: " << sqlite3_errmsg(db) << std::endl;
+ sqlite3_finalize(updateStmt);
+ sqlite3_close(db);
+ return {};
+ }
+ bindIndex++;
+ }
+ // 绑定模型 ID
+ rc = sqlite3_bind_text(updateStmt, bindIndex, model_id.c_str(), model_id.length(), SQLITE_STATIC);
+ if (rc != SQLITE_OK) {
+ std::cerr << "绑定模型 ID 失败: " << sqlite3_errmsg(db) << std::endl;
+ sqlite3_finalize(updateStmt);
+ sqlite3_close(db);
+ return {};
+ }
+ // 执行更新
+ rc = sqlite3_step(updateStmt);
+ if (rc != SQLITE_DONE) {
+ std::cerr << "数据库更新失败: " << sqlite3_errmsg(db) << std::endl;
+ sqlite3_finalize(updateStmt);
+ sqlite3_close(db);
+ return {};
+ }
+ sqlite3_finalize(updateStmt);
+52
+实时动态库存需求预测分析平台 v1.0
+ sqlite3_close(db);
+ return updated;
+}
+#include <stdexcept>
+#include <vector>
+#include <string>
+#include <Poco/Data/Session.h>
+#include <Poco/Data/SQLite/SQLite.h>
+#include <Poco/Data/Statement.h>
+#include <Poco/LogStream.h>
+struct AccessLevel {
+ std::string module; // 模块名称
+ std::string permission; // 权限详情
+};
+std::vector<AccessLevel> getUserAccessLevels(int user_id) {
+ // 参数校验
+ if (user_id <= 0) {
+ POCO_LOG_ERROR(Poco::Logger::get("AccessControl"), "无效的用户 ID");
+ throw std::invalid_argument("用户 ID 必须大于 0");
+ }
+ try {
+ // 初始化数据库连接
+ Poco::Data::Session session("SQLite", "retail_db.sqlite3");
+ // 创建查询语句
+ Poco::Data::Statement stmt(session);
+ stmt << "SELECT module, permission FROM access_levels WHERE user_id = ?", 
+ into(AccessLevel::module), into(AccessLevel::permission), use(user_id);
+ // 初始化结果容器
+ std::vector<AccessLevel> access_levels;
+ // 执行查询并填充结果
+ while (!stmt.done()) {
+ AccessLevel level;
+ stmt >> level.module >> level.permission;
+ access_levels.push_back(level);
+ }
+ return access_levels;
+ } catch (const Poco::Data::SQLite::SQLiteException& e) {
+ POCO_LOG_ERROR(Poco::Logger::get("AccessControl"), "数据库操作异常: " + std::string(e.what()));
+ throw std::runtime_error("数据库查询失败");
+ } catch (const std::exception& e) {
+ POCO_LOG_ERROR(Poco::Logger::get("AccessControl"), "未知异常: " + std::string(e.what()));
+ throw;
+ }
+}
+#include <sqlite3.h>
+#include <string>
+#include <vector>
+#include <stdexcept>
+#include <optional>
+#include <iostream>
+53
+实时动态库存需求预测分析平台 v1.0
+// 定义角色信息结构体
+struct Role {
+ int id; // 角色 ID
+ std::string name; // 角色名称
+ std::vector<std::string> modules; // 功能模块
+ int access_level; // 访问等级
+ std::string created_at; // 创建日期
+ std::string updated_at; // 更新日期
+};
+// 自定义异常类: 角色未找到
+class RoleNotFoundException : public std::runtime_error {
+public:
+ explicit RoleNotFoundException(int id) 
+ : std::runtime_error("Role with ID " + std::to_string(id) + " was not found") {}
+ int getStatusCode() const { return 404; } // 返回 HTTP 状态码
+};
+// 自定义异常类: 数据库操作错误
+class DatabaseException : public std::runtime_error {
+public:
+ explicit DatabaseException(const std::string& message) : std::runtime_error(message) {}
+ int getStatusCode() const { return 500; } // 返回 HTTP 状态码
+};
+// 根据角色 ID 查询完整的角色信息
+std::optional<Role> getRoleDetails(int roleId) {
+ // 验证角色 ID 有效性
+ if (roleId <= 0) {
+ throw std::invalid_argument("Role ID must be a positive integer");
+ }
+ // 获取默认数据库连接
+ sqlite3* db;
+ int rc = sqlite3_open("roles.db", &db);
+ if (rc != SQLITE_OK) {
+ // 记录错误日志（生产环境应使用实际日志系统）
+ std::cerr << "Database connection failed: " << sqlite3_errmsg(db) << std::endl;
+ throw DatabaseException("Failed to connect to database");
+ }
+ // 构造 SQL 查询语句
+ const std::string sql = "SELECT id, name, modules, access_level, created_at, updated_at FROM roles WHERE id = ?";
+ // 预处理语句
+ sqlite3_stmt* stmt;
+ rc = sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
+ if (rc != SQLITE_OK) {
+ sqlite3_close(db);
+ std::cerr << "SQL statement preparation failed: " << sqlite3_errmsg(db) << std::endl;
+ throw DatabaseException("Failed to prepare SQL statement");
+ }
+ // 绑定参数
+ rc = sqlite3_bind_int(stmt, 1, roleId);
+ if (rc != SQLITE_OK) {
+ sqlite3_finalize(stmt);
+54
+实时动态库存需求预测分析平台 v1.0
+ sqlite3_close(db);
+ std::cerr << "Failed to bind parameter: " << sqlite3_errmsg(db) << std::endl;
+ throw DatabaseException("Failed to bind role ID parameter");
+ }
+ // 执行查询并解析结果
+ Role role;
+ if (sqlite3_step(stmt) != SQLITE_ROW) {
+ sqlite3_finalize(stmt);
+ sqlite3_close(db);
+ std::cerr << "Query returned no results" << std::endl;
+ throw RoleNotFoundException(roleId);
+ }
+ // 提取查询结果
+ role.id = sqlite3_column_int(stmt, 0);
+ role.name = sqlite3_column_text(stmt, 1) ? std::string(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1))) : "";
+ const char* modulesStr = sqlite3_column_text(stmt, 2);
+ if (modulesStr) {
+ role.modules = parseModules(modulesStr);
+ } else {
+ role.modules.clear();
+ }
+ role.access_level = sqlite3_column_int(stmt, 3);
+ role.created_at = sqlite3_column_text(stmt, 4) ? std::string(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 4))) : 
+"";
+ role.updated_at = sqlite3_column_text(stmt, 5) ? std::string(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 5))) : 
+"";
+ // 清理资源
+ sqlite3_finalize(stmt);
+ sqlite3_close(db);
+ return role;
+}
+// 拆分功能模块字符串为向量
+std::vector<std::string> parseModules(const char* modulesStr) {
+ std::vector<std::string> modules;
+ if (!modulesStr) return modules;
+ std::string modulesCopy(modulesStr);
+ size_t pos = 0;
+ while ((pos = modulesCopy.find(',', pos)) != std::string::npos) {
+ modules.push_back(modulesCopy.substr(0, pos));
+ pos++;
+ }
+ modules.push_back(modulesCopy.substr(pos));
+ return modules;
+}
+#include <sqlite3.h>
+#include <stdexcept>
+#include <string>
+#include <iostream>
+#include <cstdint>
+// 获取默认数据库连接
+55
+实时动态库存需求预测分析平台 v1.0
+sqlite3* getDatabaseConnection() {
+ sqlite3* db;
+ int result = sqlite3_open(":memory:", &db); // 示例内存数据库，实际部署需替换为具体数据库路径
+ if (result != SQLITE_OK) {
+ throw std::runtime_error("无法打开数据库");
+ }
+ return db;
+}
+// 移除用户与角色的关联
+int removeUserRole(int userId, int roleId) {
+ // 参数校验
+ if (userId <= 0 || roleId <= 0) {
+ throw std::invalid_argument("用户 ID 和角色 ID 必须大于 0");
+ }
+ sqlite3* db = getDatabaseConnection();
+ sqlite3_stmt* stmt = nullptr;
+ int result = 0;
+ try {
+ // 初始化数据库连接
+ std::string sql = "DELETE FROM user_role WHERE user_id = ? AND role_id = ?";
+ result = sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
+ if (result != SQLITE_OK) {
+ throw std::runtime_error("预编译语句准备失败");
+ }
+ // 绑定参数
+ sqlite3_bind_int(stmt, 1, userId);
+ sqlite3_bind_int(stmt, 2, roleId);
+ // 执行 SQL 语句
+ result = sqlite3_step(stmt);
+ if (result != SQLITE_DONE) {
+ throw std::runtime_error("删除操作失败");
+ }
+ // 释放资源
+ sqlite3_finalize(stmt);
+ } catch (const std::exception& e) {
+ // 记录错误日志
+ std::cerr << "数据库操作异常: " << e.what() << std::endl;
+ if (stmt) sqlite3_finalize(stmt);
+ sqlite3_close(db);
+ return 500; // HTTP 500 Internal Server Error
+ } catch (...) {
+ // 记录错误日志
+ std::cerr << "未知异常发生" << std::endl;
+ if (stmt) sqlite3_finalize(stmt);
+ sqlite3_close(db);
+ return 500; // HTTP 500 Internal Server Error
+ }
+ // 释放剩余资源
+ sqlite3_close(db);
+ return 200; // HTTP 200 OK
+56
+实时动态库存需求预测分析平台 v1.0
+}
+#include <sqlite3.h>
+#include <vector>
+#include <string>
+#include <stdexcept>
+#include <iostream>
+// 定义返回的权限信息结构体
+struct RoleFunctionPermission {
+ std::string functionName; // 功能模块名称
+ int permissionLevel; // 访问等级
+};
+/**
+ * 根据角色 ID 查询对应的功能模块访问权限列表
+ * @param roleId 角色唯一标识符，必须为正整数
+ * @return 返回该角色的可访问功能模块及对应的访问等级
+ * @throws std::invalid_argument 如果输入角色 ID 无效
+ * @throws std::runtime_error 如果数据库操作失败
+ */
+std::vector<RoleFunctionPermission> getRoleFunctionPermissions(int roleId) {
+ // 参数校验：确保角色 ID 为正整数
+ if (roleId <= 0) {
+ throw std::invalid_argument("Role ID must be a positive integer.");
+ }
+ // 初始化数据库连接
+ sqlite3* db = nullptr;
+ int rc = sqlite3_open("retail_db.db", &db);
+ if (rc != SQLITE_OK) {
+ std::cerr << "数据库连接失败: " << sqlite3_errmsg(db) << std::endl;
+ throw std::runtime_error("Failed to connect to database.");
+ }
+ // 准备 SQL 查询语句
+ std::string sql = "SELECT f.name, rf.permission_level "
+ "FROM role_functions rf "
+ "JOIN functions f ON rf.function_id = f.id "
+ "WHERE rf.role_id = ?";
+ sqlite3_stmt* stmt = nullptr;
+ rc = sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
+ if (rc != SQLITE_OK) {
+ std::cerr << "SQL 预处理错误: " << sqlite3_errmsg(db) << std::endl;
+ sqlite3_close(db);
+ throw std::runtime_error("Failed to prepare SQL statement.");
+ }
+ // 绑定角色 ID 参数
+ rc = sqlite3_bind_int(stmt, 1, roleId);
+ if (rc != SQLITE_OK) {
+ std::cerr << "参数绑定错误: " << sqlite3_errmsg(db) << std::endl;
+ sqlite3_finalize(stmt);
+ sqlite3_close(db);
+ throw std::runtime_error("Failed to bind role ID parameter.");
+ }
+57
+实时动态库存需求预测分析平台 v1.0
+ // 执行查询并处理结果
+ std::vector<RoleFunctionPermission> permissions;
+ while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+ std::string functionName(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0)));
+ int permissionLevel = sqlite3_column_int(stmt, 1);
+ permissions.emplace_back(functionName, permissionLevel);
+ }
+ // 检查查询结果是否异常
+ if (rc != SQLITE_DONE) {
+ std::cerr << "查询执行错误: " << sqlite3_errmsg(db) << std::endl;
+ sqlite3_finalize(stmt);
+ sqlite3_close(db);
+ throw std::runtime_error("Query execution resulted in an error.");
+ }
+ // 清理资源
+ sqlite3_finalize(stmt);
+ sqlite3_close(db);
+ return permissions;
+}
+#include <sqlite3.h>
+#include <stdexcept>
+#include <string>
+#include <iostream>
+#include <memory>
+// 自定义异常类，用于统一处理业务异常
+class UserRoleException : public std::exception {
+public:
+ UserRoleException(const std::string& message) : msg_(message) {}
+ const char* what() const noexcept override {
+ return msg_.c_str();
+ }
+private:
+ std::string msg_;
+};
+// 数据库连接句柄，使用 unique_ptr 自动释放
+using DatabaseHandle = std::unique_ptr<sqlite3, decltype(&sqlite3_close)>;
+int addUserRole(int userId, int roleId, const std::string& module, int accessLevel) {
+ // 参数校验
+ if (userId <= 0) {
+ throw UserRoleException("用户 ID 必须为正整数");
+ }
+ if (roleId <= 0) {
+ throw UserRoleException("角色 ID 必须为正整数");
+ }
+ if (module.empty()) {
+ throw UserRoleException("功能模块不能为空");
+ }
+ if (accessLevel < 0 || accessLevel > 3) {
+ throw UserRoleException("访问等级必须在 0 到 3 之间");
+ }
+58
+实时动态库存需求预测分析平台 v1.0
+ // 初始化数据库连接
+ DatabaseHandle db(sqlite3_open("retail_db.db", nullptr), sqlite3_close);
+ if (!db) {
+ throw UserRoleException("无法打开数据库");
+ }
+ // 检查模块是否有效（根据零售业/供应链管理业务规则）
+ if (module != "inventory" && module != "supply_chain") {
+ throw UserRoleException("功能模块只能是 'inventory' 或 'supply_chain'");
+ }
+ // 准备 SQL 语句
+ std::string sql = "INSERT INTO user_roles (user_id, role_id, module, access_level) VALUES (?, ?, ?, ?)";
+ sqlite3_stmt* stmt;
+ int rc = sqlite3_prepare_v2(db.get(), sql.c_str(), -1, &stmt, nullptr);
+ if (rc != SQLITE_OK) {
+ throw UserRoleException("准备 SQL 语句失败");
+ }
+ // 绑定参数
+ rc = sqlite3_bind_int(stmt, 1, userId);
+ if (rc != SQLITE_OK) {
+ throw UserRoleException("绑定用户 ID 参数失败");
+ }
+ rc = sqlite3_bind_int(stmt, 2, roleId);
+ if (rc != SQLITE_OK) {
+ throw UserRoleException("绑定角色 ID 参数失败");
+ }
+ rc = sqlite3_bind_text(stmt, 3, module.c_str(), module.size(), SQLITE_TRANSIENT);
+ if (rc != SQLITE_OK) {
+ throw UserRoleException("绑定功能模块参数失败");
+ }
+ rc = sqlite3_bind_int(stmt, 4, accessLevel);
+ if (rc != SQLITE_OK) {
+ throw UserRoleException("绑定访问等级参数失败");
+ }
+ // 执行插入操作
+ rc = sqlite3_step(stmt);
+ if (rc != SQLITE_DONE) {
+ // 记录错误日志
+ std::cerr << "数据库操作失败: " << sqlite3_errmsg(db.get()) << std::endl;
+ throw UserRoleException("数据库操作失败");
+ }
+ // 清理资源
+ sqlite3_finalize(stmt);
+ // 返回成功状态码
+ return 200;
+}
+#include <iostream>
+#include <stdexcept>
+#include <sqlite3.h>
+#include <memory>
+using namespace std;
+59
+实时动态库存需求预测分析平台 v1.0
+enum class AccessLevel { Read, Write, Admin };
+bool updateRoleAccessLevel(int roleId, int moduleId, AccessLevel newAccessLevel) {
+ // 参数校验
+ if (roleId <= 0) {
+ throw invalid_argument("Role ID must be positive");
+ }
+ if (moduleId <= 0) {
+ throw invalid_argument("Module ID must be positive");
+ }
+ if (newAccessLevel < AccessLevel::Read || newAccessLevel > AccessLevel::Admin) {
+ throw invalid_argument("Invalid access level value");
+ }
+ // 获取数据库连接
+ sqlite3* db;
+ int rc = sqlite3_open("database.db", &db);
+ if (rc != SQLITE_OK) {
+ throw runtime_error("Failed to open database connection");
+ }
+ // 准备更新语句
+ string sql = "UPDATE role_access_level SET access_level = ? WHERE role_id = ? AND module_id = ?";
+ sqlite3_stmt* stmt;
+ rc = sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
+ if (rc != SQLITE_OK) {
+ sqlite3_close(db);
+ throw runtime_error("SQL statement preparation failed");
+ }
+ // 绑定参数
+ int accessLevelInt = static_cast<int>(newAccessLevel);
+ sqlite3_bind_int(stmt, 1, accessLevelInt);
+ sqlite3_bind_int(stmt, 2, roleId);
+ sqlite3_bind_int(stmt, 3, moduleId);
+ // 执行更新操作
+ rc = sqlite3_step(stmt);
+ if (rc != SQLITE_DONE) {
+ sqlite3_close(db);
+ throw runtime_error("Failed to execute update operation");
+ }
+ // 获取受影响的行数
+ int rowsAffected = sqlite3_changes(db);
+ if (rowsAffected == 0) {
+ sqlite3_close(db);
+ throw runtime_error("No rows affected, update not applied");
+ }
+ // 释放资源
+ sqlite3_finalize(stmt);
+ sqlite3_close(db);
+ return true;
+}
+60
