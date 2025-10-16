@@ -14,14 +14,14 @@ struct DemandPrediction {
 };
 std::vector<DemandPrediction> get_all_demand_predictions() {
  try {
- //获取
+ //数据
  std::unique_ptr<sqlite3, decltype(&sqlite3_close)> db_connection(
  nullptr, sqlite3_close);
  int rc = sqlite3_open("demand_predictions.db", db_connection.release());
  if (rc != SQLITE_OK) {
  throw std::runtime_error("Failed to connect to database");
  }
- // 初始化数据库连接
+ // 初始化
  std::vector<DemandPrediction> result;
  std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)> stmt(
  nullptr, sqlite3_finalize);
@@ -6200,6 +6200,7 @@ bool updateRoleAccessLevel(int roleId, int moduleId, AccessLevel newAccessLevel)
 }
 
 60
+
 
 
 
